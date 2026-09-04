@@ -50,6 +50,41 @@ package object roundoff {
     */
   object optRoundoffExactInputs extends inox.FlagOptionDef("roundoff-exact-inputs", false)
 
+  /** How long the divergence queries of one function may take, all told.
+    *
+    * A budget rather than an allowance per query, because the queries of one function differ
+    * enormously in what they need: most settle in a millisecond or two and a few never settle
+    * at all. Whatever a query leaves unspent is divided among the ones after it, so a function
+    * whose regions are all easy finishes in a fraction of this and a function with one hard
+    * region spends it all there.
+    *
+    * The phases before the queries are subtracted from it, so this bounds the analysis of a
+    * function rather than only its search. Work shared by every function is not, since there
+    * is no honest way to charge one function for a batch that answered for all of them.
+    */
+  object optRoundoffTimeout extends inox.OptionDef[Double] {
+    import inox.OptionParsers._
+    val name = "roundoff-timeout"
+    val default = 1.0
+    val parser = doubleParser
+    val usageRhs = "SECONDS"
+  }
+
+  /** What fraction of a query's share goes on asking whether its region holds any point.
+    *
+    * The rest is split between the two ends of the enclosure. Deciding a region is empty is
+    * the cheapest useful thing the search does and usually takes a millisecond, so it is given
+    * a small slice; raise it where regions are being searched that a longer look would have
+    * refuted outright.
+    */
+  object optRoundoffFeasibilityShare extends inox.OptionDef[Double] {
+    import inox.OptionParsers._
+    val name = "roundoff-feasibility-share"
+    val default = 0.1
+    val parser = doubleParser
+    val usageRhs = "0..1"
+  }
+
   /** Where to write what each branch-divergence query established, empty for nowhere.
     *
     * A `@fuzz` function also gets a program and a configuration for the fuzzer, written

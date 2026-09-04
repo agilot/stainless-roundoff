@@ -59,12 +59,35 @@ trait RoundoffChecker extends VerificationChecker {
       .filter(_.flags.exists { case Roundoff(_) => true; case _ => false })
       .sortBy(_.id.globalId)
 
+  /** Where every phase of this analysis reports its time, under `--debug=timers`.
+    *
+    * The phases are siblings and one pair of them overlaps: `pruning.questions` is asked while
+    * `paths` is enumerating, so its time is part of that. Everything else is disjoint.
+    */
+  private lazy val phases: inox.utils.TimerStorage = timers.verification.roundoff
+
+  private lazy val analysed: Seq[(Identifier, Long, Either[String, ErrorDecomposition])] =
+    annotated.map { fd =>
+      val start = System.nanoTime()
+      val outcome = withOracle(fd) { oracle =>
+        ErrorDecomposition.of(fd, exactInputs, mode, oracle, phases)(using program.symbols)
+      }
+      (fd.id, (System.nanoTime() - start) / 1000000, outcome)
+    }
+
   private lazy val decompositions: Map[Identifier, Either[String, ErrorDecomposition]] =
-    annotated
-      .map(fd => fd.id -> withOracle(fd) { oracle =>
-        ErrorDecomposition.of(fd, exactInputs, mode, oracle)(using program.symbols)
-      })
-      .toMap
+    analysed.map { case (id, _, outcome) => id -> outcome }.toMap
+
+  /** How long everything before the divergence queries took, for each function.
+    *
+    * The budget is net of this, so that it bounds the analysis of a function rather than only
+    * its search. What the analyzer takes is not counted: it answers one batch for every
+    * function at once, and there is no honest way to charge that to any one of them.
+    */
+  private lazy val spentOn: Map[Identifier, Long] =
+    analysed.map { case (id, spent, _) => id -> spent }.toMap
+
+  private lazy val budget: Double = context.options.findOptionOrDefault(optRoundoffTimeout)
 
   /** How long one question about a branch may take where no timeout was asked for, so that a
     * hard floating-point query costs the run a moment rather than the whole of it.
@@ -96,13 +119,25 @@ trait RoundoffChecker extends VerificationChecker {
     if (solverRefused) block(BranchOracle.open)
     else {
       val factory = getFactory(options + optCheckModels(false) + optSilentErrors(true))
-      val solver = factory.getNewSolver()
-      if (solver.optTimeout.isEmpty) solver.setTimeout(branchTimeout)
+      var started: Option[factory.S] = None
+
+      // Built by the first question rather than up front, since a function whose body has no
+      // conditional in it asks none at all, and most of them do not.
+      def solver: factory.S = started match {
+        case Some(ready) => ready
+        case None =>
+          val fresh = phases.pruning.setup.run {
+            val s = factory.getNewSolver()
+            if (s.optTimeout.isEmpty) s.setTimeout(branchTimeout)
+            fd.params.foreach(s.declare)
+            fd.precondition.map(Preprocessor.stripAnnotations).foreach(s.assertCnstr)
+            s
+          }
+          started = Some(fresh)
+          fresh
+      }
 
       try {
-        fd.params.foreach(solver.declare)
-        fd.precondition.map(Preprocessor.stripAnnotations).foreach(solver.assertCnstr)
-
         block(new BranchOracle {
           def assuming[B](condition: Expr)(block: => B): Option[B] =
             if (solverRefused) Some(block)
@@ -112,7 +147,7 @@ trait RoundoffChecker extends VerificationChecker {
                 solver.assertCnstr(condition)
                 // A question left open has to keep the branch: only a refutation says that
                 // no input reaches it.
-                val answer = scala.util.Try(solver.check(Simple))
+                val answer = phases.pruning.questions.runAndGetTime(solver.check(Simple))._2
                 told(fd, condition, answer)
                 answer match {
                   case scala.util.Success(Unsat) => None
@@ -126,7 +161,7 @@ trait RoundoffChecker extends VerificationChecker {
       } catch {
         case e: inox.Unsupported => refused(fd, e); block(BranchOracle.open)
       } finally {
-        factory.reclaim(solver)
+        started.foreach(factory.reclaim)
       }
     }
 
@@ -204,13 +239,20 @@ trait RoundoffChecker extends VerificationChecker {
   /** Every query of every annotated function goes out in one batch, because the analyzer
     * pays its startup cost once per run.
     */
+  /** Every query of every annotated function goes out in one batch, because the analyzer
+    * pays its startup cost once per run.
+    *
+    * That one batch holds the branches and the conditions together, and the analyzer's own
+    * timing cannot separate them either: its results carry a figure for the whole run, repeated
+    * against every function in it. So `rounding` is one phase covering both.
+    */
   private lazy val measured: Map[String, Either[String, RoundingResult]] = {
     val queries = decompositions.values
       .collect { case Right(parts) => parts.queries }
       .flatten.toSeq
       .distinctBy(_.name)
 
-    if (queries.isEmpty) Map.empty else analyzer.analyze(queries)
+    if (queries.isEmpty) Map.empty else phases.rounding.run(analyzer.analyze(queries))
   }
 
   private def checkRoundoff(vc: VC, bound: Option[BigDecimal]): VCResult = {
@@ -218,7 +260,7 @@ trait RoundoffChecker extends VerificationChecker {
 
     val (time, outcome) = timers.verification.runAndGetTime {
       val result = errorOf(vc.fid)
-      witnessFile.foreach(writeFuzzerInput)
+      witnessFile.foreach(file => phases.witnesses.run(writeFuzzerInput(file)))
       // Asked for only once the function has been analyzed, since the fuzzer searches the
       // regions that analysis established.
       val observed = fuzzedError(fd)
@@ -290,22 +332,25 @@ trait RoundoffChecker extends VerificationChecker {
                        }
         rounding <- traverse(parts.reachableLeaves)(errorFrom)
         name = getFunction(fid).id.name
-        bounds <- parts.discontinuities match {
-                    case DiscontinuityPlan.Pairwise(problems) =>
-                      traverse(problems.zipWithIndex) { case (problem, path) =>
-                        ibex.discontinuityBound(problem, parts.guardDifferences, guardErrors,
-                                                Site(name, path))
-                      }
-                    case DiscontinuityPlan.Merged(regions) =>
-                      traverse(regions) { region =>
-                        ibex.mergedBound(region, parts.guardDifferences, guardErrors,
-                                         Site(name, region.guard))
-                      }
-                    case DiscontinuityPlan.ViaReference(regions) =>
-                      traverse(regions) { region =>
-                        ibex.referenceBound(region, parts.guardDifferences, guardErrors,
-                                            Site(name, region.guard))
-                      }
+        remaining = remainingFor(fid)
+        bounds <- ibex.within(remaining, parts.discontinuities.queries) {
+                    parts.discontinuities match {
+                      case DiscontinuityPlan.Pairwise(problems) =>
+                        traverse(problems.zipWithIndex) { case (problem, path) =>
+                          ibex.discontinuityBound(problem, parts.guardDifferences, guardErrors,
+                                                  Site(name, path))
+                        }
+                      case DiscontinuityPlan.Merged(regions) =>
+                        traverse(regions) { region =>
+                          ibex.mergedBound(region, parts.guardDifferences, guardErrors,
+                                           Site(name, region.guard))
+                        }
+                      case DiscontinuityPlan.ViaReference(regions) =>
+                        traverse(regions) { region =>
+                          ibex.referenceBound(region, parts.guardDifferences, guardErrors,
+                                              Site(name, region.guard))
+                        }
+                    }
                   }
       } yield {
         val worstDiscontinuity = (BigDecimal(0) +: bounds).max
@@ -323,6 +368,19 @@ trait RoundoffChecker extends VerificationChecker {
         new BigDecimal(worstDiscontinuity.bigDecimal, reportedPrecision) + worstRounding
       }
     }
+
+  /** What is left of a function's budget once the phases before the queries are taken off. */
+  private def remainingFor(fid: Identifier): Double = {
+    val spent = spentOn.getOrElse(fid, 0L) / 1000.0
+    val left = budget - spent
+
+    if (left <= 0)
+      reporter.warning(getFunction(fid).getPos,
+        s"Reading ${getFunction(fid).id.asString} took ${spent}s of a ${budget}s budget, so its " +
+        "divergences are bounded on whatever is left of it; --roundoff-timeout raises it")
+
+    left
+  }
 
   private def errorFrom(source: RoundingError): Either[String, BigDecimal] = source match {
     case RoundingError.Exact => Right(BigDecimal(0))
@@ -384,7 +442,7 @@ trait RoundoffChecker extends VerificationChecker {
     if (!fuzzer.enabled || subjects.isEmpty) None
     else {
       if (!observed.contains(function)) {
-        val outcome = fuzzer.run(writeSubjects(witnessFile.getOrElse(scratch)))
+        val outcome = phases.fuzzing.run(fuzzer.run(writeSubjects(witnessFile.getOrElse(scratch))))
         outcome.foreach(errors => observed ++= errors.view.mapValues(Right(_)))
         if (!observed.contains(function))
           observed(function) =

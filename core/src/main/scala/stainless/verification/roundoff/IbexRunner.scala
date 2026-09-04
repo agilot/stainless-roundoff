@@ -26,6 +26,39 @@ class IbexRunner(ctx: inox.Context, recordWitnesses: Boolean) {
   import ctx.reporter
   import inox.trees._
 
+  /** Where this runner reports its time, beside the other phases of the analysis.
+    *
+    * `region` covers a whole region and so contains the `feasibility` and `optimum` queries
+    * made inside it; they are listed beside it rather than under it because one region holds
+    * many of each.
+    */
+  private val phases: inox.utils.TimerStorage = ctx.timers.verification.roundoff.ibex
+
+  /** What share of a query goes on deciding whether its region is empty. */
+  private val feasibilityShare: Double =
+    ctx.options.findOptionOrDefault(optRoundoffFeasibilityShare).max(0.0).min(1.0)
+
+  private var deadline: Long = 0L
+  private var pending: Int = 0
+
+  /** Bounds the divergences of one function inside a budget divided among its queries.
+    *
+    * The share is worked out again before each one, from the clock rather than from a plan, so
+    * a query that settles at once leaves the rest of its share to the queries after it and a
+    * query that settles slowly takes only its own.
+    */
+  def within[A](seconds: Double, queries: Int)(block: => A): A = synchronized {
+    deadline = System.nanoTime() + (seconds.max(0.0) * 1e9).toLong
+    pending = queries
+    try block finally { deadline = 0L; pending = 0 }
+  }
+
+  /** What the next query may spend: the time left over the queries left. */
+  private def slice(): Double = {
+    val left = (deadline - System.nanoTime()) / 1e9
+    left.max(0.0) / pending.max(1)
+  }
+
   private lazy val optimizer: IbexOptimizer { val program: IbexRunner.this.program.type } =
     IbexOptimizer(program, ctx)
 
@@ -68,9 +101,9 @@ class IbexRunner(ctx: inox.Context, recordWitnesses: Boolean) {
 
       val searched: Either[String, Seq[Verdict]] =
         if (reachable.isEmpty) Right(Seq.empty)
-        else searching(problem.vars, problem.constraints) {
+        else phases.region.run(searching(problem.vars, problem.constraints) {
           traverse(reachable)(divergenceBound(_, guardDifferences, guardErrors, site))
-        }
+        })
 
       searched.map { verdicts =>
         val worst = (BigDecimal(0) +: verdicts.map(_.bound)).max
@@ -103,7 +136,7 @@ class IbexRunner(ctx: inox.Context, recordWitnesses: Boolean) {
         summarize(s"${site.function} guard ${site.region}", refused, BigDecimal(0))
         Right(BigDecimal(0))
       } else {
-        val searched = searching(region.vars,
+        val searched = phases.region.run(searching(region.vars,
                                  region.shared ++ band(region.guard, error, guardDifferences)) {
           def measured(comparisons: Seq[ReferenceComparison]) =
             traverse(comparisons)(
@@ -111,7 +144,7 @@ class IbexRunner(ctx: inox.Context, recordWitnesses: Boolean) {
 
           for { near <- measured(region.taken); far <- measured(region.untaken) }
             yield (near, far)
-        }
+        })
 
         searched.map { case (near, far) =>
           val worst = furthest(near) + furthest(far)
@@ -145,10 +178,10 @@ class IbexRunner(ctx: inox.Context, recordWitnesses: Boolean) {
         summarize(s"${site.function} guard ${site.region}", refused, BigDecimal(0))
         Right(BigDecimal(0))
       } else {
-        val searched = searching(region.vars,
+        val searched = phases.region.run(searching(region.vars,
                                  region.shared ++ band(region.guard, error, guardDifferences)) {
           traverse(region.pairs)(crossDistance(_, guardDifferences, guardErrors, site))
-        }
+        })
 
         searched.map { verdicts =>
           val worst = furthest(verdicts)
@@ -231,6 +264,9 @@ class IbexRunner(ctx: inox.Context, recordWitnesses: Boolean) {
                       guardDifferences: Seq[Expr], guardErrors: Seq[BigDecimal],
                       refused: => Witness,
                       bounded: (Boolean, Box) => Witness): Either[String, Verdict] = {
+    val budget = slice()
+    pending -= 1
+
     optimizer.push()
     try {
       choices.foreach { choice =>
@@ -241,16 +277,20 @@ class IbexRunner(ctx: inox.Context, recordWitnesses: Boolean) {
       }
 
       // An empty region means no point of it takes this path, so there is nothing to
-      // optimize over.
-      optimizer.check(Simple) match {
+      // optimize over. Deciding that is the cheap half of the question, so it is asked
+      // first and given the smaller part of the budget.
+      optimizer.setSearchTimeout(budget * feasibilityShare)
+      phases.feasibility.run(optimizer.check(Simple)) match {
         case Unsat =>
           record(refused)
           Right(Verdict(DivergenceStatus.Infeasible, BigDecimal(0)))
 
         case _ =>
+          // Whatever the emptiness check left goes to the two ends, which share it evenly.
+          val each = budget * (1.0 - feasibilityShare) / 2.0
           for {
-            high <- extremum(objective, maximizing = true, bounded)
-            low <- extremum(objective, maximizing = false, bounded)
+            high <- extremum(objective, maximizing = true, each, bounded)
+            low <- extremum(objective, maximizing = false, each, bounded)
           } yield Verdict(DivergenceStatus.Bounded, high.abs max low.abs)
       }
     } finally {
@@ -258,11 +298,12 @@ class IbexRunner(ctx: inox.Context, recordWitnesses: Boolean) {
     }
   }
 
-  private def extremum(objective: Expr, maximizing: Boolean,
+  private def extremum(objective: Expr, maximizing: Boolean, budget: Double,
                        bounded: (Boolean, Box) => Witness): Either[String, BigDecimal] = {
+    optimizer.setSearchTimeout(budget)
     if (maximizing) optimizer.maximize(objective) else optimizer.minimize(objective)
 
-    optimizer.check(Simple) match {
+    phases.optimum.run(optimizer.check(Simple)) match {
       case Unsat => Left("the region became infeasible while bounding a difference")
 
       case _ =>

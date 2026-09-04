@@ -213,6 +213,17 @@ enum DiscontinuityPlan {
     case Merged(regions) => regions.size
     case ViaReference(regions) => regions.size
   }
+
+  /** How many divergences will be asked about, so that a budget can be divided among them.
+    *
+    * An upper bound: one of these is refused without being asked wherever the guard it
+    * crosses rounds exactly. That only leaves the queries after it a larger share.
+    */
+  def queries: Int = this match {
+    case Pairwise(problems) => problems.map(_.divergentPaths.size).sum
+    case Merged(regions) => regions.map(_.pairs.size).sum
+    case ViaReference(regions) => regions.map(r => r.taken.size + r.untaken.size).sum
+  }
 }
 
 /** Turns the paths of one function into the real-arithmetic problems that bound how far
@@ -479,13 +490,18 @@ case class ErrorDecomposition(
 
 object ErrorDecomposition {
 
+  /** @param timers where each phase reports how long it took; detached by default, so a
+    *               caller with no context of its own measures nothing
+    */
   def of(fd: FunDef, exactInputs: Boolean, mode: DiscontinuityMode,
-         oracle: BranchOracle = BranchOracle.open)(using Symbols)
+         oracle: BranchOracle = BranchOracle.open,
+         timers: inox.utils.TimerStorage = inox.utils.TimerStorage())(using Symbols)
     : Either[String, ErrorDecomposition] =
     for {
-      body <- Preprocessor(fd)
-      spec <- FPCoreEmitter.specOf(fd, body)
-      (guards, paths) <- PathExtractor(body, oracle)
+      body <- timers.preprocessing.run(Preprocessor(fd))
+      spec <- timers.preprocessing.run(FPCoreEmitter.specOf(fd, body))
+      // The questions asked while enumerating are timed inside this, under `paths.pruning`.
+      (guards, paths) <- timers.paths.run(PathExtractor(body, oracle))
 
       // Every leaf refused leaves the function with nothing a run can compute, which is what
       // an unsatisfiable precondition looks like from here.
@@ -498,15 +514,15 @@ object ErrorDecomposition {
       leafNames = paths.map(_.leaf).distinct.zipWithIndex.toMap
       guardNames = guards.distinct.zipWithIndex.toMap
 
-      leaves <- traverse(paths) { path =>
+      leaves <- timers.queries.branches.run(traverse(paths) { path =>
                   if (!path.reachable) Right(RoundingError.Unreachable)
                   else {
                     val k = leafNames(path.leaf)
                     errorOf(fd, s"${prefix(fd)}_leaf$k", s"${fd.id.name} (leaf ${k + 1})",
                             path.leaf, spec, exactInputs)
                   }
-                }
-      operandErrors <- traverse(guards) { guard =>
+                })
+      operandErrors <- timers.queries.conditions.run(traverse(guards) { guard =>
                          val k = guardNames(guard)
                          for {
                            lhs <- errorOf(fd, s"${prefix(fd)}_guard${k}_lhs",
@@ -516,11 +532,12 @@ object ErrorDecomposition {
                                           s"${fd.id.name} (guard ${k + 1}, right)",
                                           guard.rhs, spec, exactInputs)
                          } yield (lhs, rhs)
-                       }
+                       })
       // Without guards there is no other path to take, so no region has to be built.
       (differences, plan) <- if (guards.isEmpty)
                                Right((Seq.empty, DiscontinuityPlan.Pairwise(Seq.empty)))
-                             else DiscontinuityEncoder(guards, paths, spec, mode)
+                             else timers.encoding.run(
+                                    DiscontinuityEncoder(guards, paths, spec, mode))
     } yield ErrorDecomposition(leaves, operandErrors, differences, plan, spec, body)
 
   private def errorOf(fd: FunDef, name: String, label: String, expr: Expr, spec: InputSpec,
