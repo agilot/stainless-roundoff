@@ -238,6 +238,8 @@ trait TreeDeconstructor extends inox.ast.TreeDeconstructor {
     case s.Wrapping => (Seq(), Seq(), Seq(), (_, _, _) => t.Wrapping)
     case s.Template => (Seq(), Seq(), Seq(), (_, _, _) => t.Template)
     case s.TerminationStatus(status) => (Seq(), Seq(), Seq(), (_, _, _) => t.TerminationStatus(status))
+    case s.Roundoff(bound) => (Seq(), bound.toSeq, Seq(), (_, es, _) => t.Roundoff(es.headOption))
+    case s.Fuzz => (Seq(), Seq(), Seq(), (_, _, _) => t.Fuzz)
     case _ => super.deconstruct(f)
   }
 }

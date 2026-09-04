@@ -16,6 +16,8 @@ trait Definitions extends inox.ast.Definitions { self: Trees =>
   case object Lazy extends Flag("lazy", Seq.empty)
   case class IndexedAt(e: Expr) extends Flag("indexedAt", Seq(e))
   case object InlineInvariant extends Flag("inlineInvariant", Seq())
+  case class Roundoff(bound: Option[Expr]) extends Flag("roundoff", Seq(bound))
+  case object Fuzz extends Flag("fuzz", Seq())
 
   case object Ghost extends Flag("ghost", Seq.empty)
   case object Extern extends Flag("extern", Seq.empty)
@@ -53,6 +55,9 @@ trait Definitions extends inox.ast.Definitions { self: Trees =>
     case ("wrapping", Seq()) => Wrapping
     case ("template", Seq()) => Template
     case ("inlineInvariant", Seq()) => InlineInvariant
+    case ("roundoff", Seq(bound)) => Roundoff(Some(bound))
+    case ("roundoff", Seq()) => Roundoff(None)
+    case ("fuzz", Seq()) => Fuzz
     case _ => Annotation(name, args)
   }
 

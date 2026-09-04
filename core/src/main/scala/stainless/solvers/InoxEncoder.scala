@@ -67,6 +67,7 @@ private def keepFlag(sourceProgram: Program)(flag: sourceProgram.trees.Flag): Bo
     case DropVCs | DropConjunct | SplitVC | Library | Synthetic | PartialEval | Extern => false
     case Opaque | Private | Final | Law | Ghost | Erasable | Wrapping | Lazy => false
     case Derived(_) | IsField(_) | IsUnapply(_, _) | IndexedAt(_) | ClassParamInit(_) => false
+    case Roundoff(_) | Fuzz => false
     case TerminationStatus(_) => false
     case InlineInvariant | Template => false
     case _ => true

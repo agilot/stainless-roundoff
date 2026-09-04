@@ -1,0 +1,132 @@
+/* Copyright 2009-2021 EPFL, Lausanne */
+
+package stainless
+package roundoff
+
+import org.scalatest.funsuite.AnyFunSuite
+import stainless.trees._
+import stainless.verification.roundoff._
+
+/** Covers how the paths of a body are enumerated, and what asking about a branch changes.
+  *
+  * Nothing here needs a solver: the oracle is a stub that records what it was asked and
+  * refuses whatever it is told to.
+  */
+class ReachabilitySuite extends AnyFunSuite {
+
+  private val f64 = FPType(11, 53)
+
+  private val a = Variable.fresh("a", f64)
+  private val b = Variable.fresh("b", f64)
+  private val c = Variable.fresh("c", f64)
+
+  private val one = Float64Literal(1.0)
+  private val two = Float64Literal(2.0)
+  private val three = Float64Literal(3.0)
+
+  /** `if (a < b) { if (b < c) 1.0 else 2.0 } else 3.0` */
+  private val nested =
+    IfExpr(FPLessThan(a, b), IfExpr(FPLessThan(b, c), one, two), three)
+
+  /** Records every question and refuses the ones it is told to. */
+  private class Stub(refuse: Expr => Boolean = _ => false) extends BranchOracle {
+    val asked = scala.collection.mutable.ArrayBuffer.empty[Expr]
+
+    def assuming[A](condition: Expr)(block: => A): Option[A] = {
+      asked += condition
+      if (refuse(condition)) None else Some(block)
+    }
+  }
+
+  private def extract(body: Expr, oracle: BranchOracle)
+    : (Seq[Guard], Seq[ProgramPath]) =
+    PathExtractor(body, oracle).fold(why => fail(why), identity)
+
+  test("refusing nothing leaves every path the body spells out") {
+    val (guards, paths) = extract(nested, BranchOracle.open)
+
+    assert(guards.size == 2)
+    assert(paths.map(_.leaf) == Seq(one, two, three))
+    assert(paths.forall(_.reachable))
+  }
+
+  test("the default oracle is the open one, so an unasked caller sees no change") {
+    val (_, paths) = PathExtractor(nested).fold(why => fail(why), identity)
+    assert(paths.map(_.leaf) == Seq(one, two, three))
+    assert(paths.forall(_.reachable))
+  }
+
+  test("not taking a guard is the negation of its comparison, never the swap of its sides") {
+    val stub = new Stub()
+    extract(IfExpr(FPLessThan(a, b), one, two), stub)
+
+    assert(stub.asked == Seq(FPLessThan(a, b), Not(FPLessThan(a, b))))
+    // The swap would be `b <= a`, which agrees over the reals and disagrees on a NaN.
+    assert(!stub.asked.contains(FPLessEquals(b, a)))
+  }
+
+  test("a guard written the other way round is oriented, and stays exact once negated") {
+    val stub = new Stub()
+    extract(IfExpr(FPGreaterEquals(a, b), one, two), stub)
+
+    // `a >= b` is `b <= a`, and its two sides agree on every input, NaN included.
+    assert(stub.asked == Seq(FPLessEquals(b, a), Not(FPLessEquals(b, a))))
+  }
+
+  test("questions arrive in preorder, one guard at a time") {
+    val stub = new Stub()
+    extract(nested, stub)
+
+    assert(stub.asked == Seq(
+      FPLessThan(a, b),                 // into the outer then
+      FPLessThan(b, c),                 // into the inner then, under the outer one
+      Not(FPLessThan(b, c)),            // into the inner else, still under it
+      Not(FPLessThan(a, b))             // into the outer else
+    ))
+  }
+
+  test("a refused branch is walked for its paths but asked nothing further") {
+    val stub = new Stub(refuse = _ == FPLessThan(a, b))
+    val (guards, paths) = extract(nested, stub)
+
+    // One question cut the whole subtree: the inner guard was never asked about.
+    assert(stub.asked == Seq(FPLessThan(a, b), Not(FPLessThan(a, b))))
+
+    // Its paths are still there, so the exact run can still be said to take them.
+    assert(paths.map(_.leaf) == Seq(one, two, three))
+    assert(paths.map(_.reachable) == Seq(false, false, true))
+
+    // And the guard below the refusal still exists, since a surviving region can name it.
+    assert(guards.size == 2)
+  }
+
+  test("refusing both sides of the only guard leaves nothing reachable") {
+    val stub = new Stub(refuse = _ => true)
+    val (_, paths) = extract(IfExpr(FPLessThan(a, b), one, two), stub)
+
+    assert(paths.size == 2)
+    assert(!paths.exists(_.reachable))
+  }
+
+  test("a connective is written out as nesting and costs no question of its own") {
+    val stub = new Stub()
+    val body = IfExpr(And(Seq(FPLessThan(a, b), FPLessThan(b, c))), one, two)
+    val (guards, paths) = extract(body, stub)
+
+    // Two comparisons, so two guards and four questions; the `And` itself is asked nothing.
+    assert(guards.size == 2)
+    assert(stub.asked.size == 4)
+    assert(stub.asked.head == FPLessThan(a, b))
+    // The else leaf is reached both by failing the first conjunct and by failing the second.
+    assert(paths.map(_.leaf) == Seq(one, two, two))
+  }
+
+  test("refusing the first conjunct cuts the second along with it") {
+    val stub = new Stub(refuse = _ == FPLessThan(a, b))
+    val body = IfExpr(And(Seq(FPLessThan(a, b), FPLessThan(b, c))), one, two)
+    val (_, paths) = extract(body, stub)
+
+    assert(stub.asked == Seq(FPLessThan(a, b), Not(FPLessThan(a, b))))
+    assert(paths.map(_.reachable) == Seq(false, false, true))
+  }
+}

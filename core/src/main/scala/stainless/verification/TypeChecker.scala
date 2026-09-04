@@ -1482,6 +1482,19 @@ class TypeChecker(val program: StainlessProgram, val context: inox.Context, val 
       case _ => sys.error("shouldn't be possible because of the filtering above")
     }
 
+    val trRoundoff: TyperResult =
+      fd.flags.collectFirst { case Roundoff(boundExpr) => boundExpr } match {
+        case None => TyperResult.valid
+        case Some(boundExpr) =>
+          val bound: Option[BigDecimal] = boundExpr.map {
+            case Float64Literal(d) => BigDecimal(d)
+            case e => reporter.fatalError(fd.getPos,
+              s"@roundoff expects a literal Double bound, got ${e.asString}")
+          }
+          buildVC(tcWithPre.withVCKind(VCKind.RoundoffError(bound)),
+            BooleanLiteral(false))
+      }
+
     // We check that the specification is SAT to avoid false => P(body(x)) type of proofs
     // To do so, we create a VC phi(x) => false, where phi(x) is the precondition. This will be checked as phi(x) => not false
     // Then we check in VerificationChecker that this VC should be SAT
@@ -1508,6 +1521,20 @@ class TypeChecker(val program: StainlessProgram, val context: inox.Context, val 
     val freshenedReturnType: Type = freshener.transform(fd.returnType)
     val bodyOpt = specced.bodyOpt.map(freshener.transform)
 
+    // A roundoff bound says how far a result sits from the exact one, which says nothing at
+    // all where the result is not a number, so a `@roundoff` function is asked for a finite
+    // one. This is an ordinary postcondition and rides the ordinary machinery, standing
+    // beside the bound rather than gating it.
+    val trRoundoffFinite: TyperResult =
+      if (!fd.flags.exists { case Roundoff(_) => true; case _ => false }) TyperResult.valid
+      else (freshenedReturnType, bodyOpt) match {
+        case (FPType(_, _), Some(body)) =>
+          val res = ValDef.fresh("res", freshenedReturnType)
+          buildVC(tcWithPre.withVCKind(VCKind.RoundoffFinite),
+            Let(res, body, And(Not(FPIsNaN(res.toVariable)), Not(FPIsInfinite(res.toVariable)))))
+        case _ => TyperResult.valid
+      }
+
     // The `TypingContext` for the body contains all dependencies, and the measure
     val tcBody = tcWithPre.withIdentifiers(deps).withMeasureType(measureType).withMeasure(measureOpt)
 
@@ -1523,7 +1550,8 @@ class TypeChecker(val program: StainlessProgram, val context: inox.Context, val 
         }
     }
 
-    (measureType, (trArgs ++ trPre ++ trPreSat.getOrElse(TyperResult.valid) ++ trMeasure ++ trBody).root(OKFunction(id)))
+    (measureType, (trArgs ++ trPre ++ trPreSat.getOrElse(TyperResult.valid) ++ trRoundoff ++
+      trRoundoffFinite ++ trMeasure ++ trBody).root(OKFunction(id)))
   }
 
   def checkType(fids: Seq[Identifier]): Seq[StainlessVC] = {

@@ -114,3 +114,18 @@ class anyHeapRef extends Annotation
 
 @ignore
 class refEq extends Annotation
+
+/**
+ * Used to verify the round-off error of the target floating-point function
+ */
+@ignore
+class roundoff(bound: Double) extends Annotation {
+  def this() = this(Double.PositiveInfinity)
+}
+
+/**
+ * Marks a @roundoff function to be handed to the fuzzer, so that the analysis writes a
+ * subject program and a configuration for it alongside the witnesses
+ */
+@ignore
+class fuzz extends Annotation

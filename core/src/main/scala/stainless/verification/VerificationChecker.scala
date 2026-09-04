@@ -6,6 +6,7 @@ package verification
 import inox.Options
 import inox.solvers.*
 import stainless.transformers.LatticesSimplifier
+import stainless.verification.roundoff.RoundoffChecker
 
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 import scala.util.{Failure, Success}
@@ -463,9 +464,9 @@ object VerificationChecker {
     }
 
     val checker = if (ctx.options.findOptionOrDefault(optVCCache)) {
-      new Checker with VerificationCache
+      new Checker with VerificationCache with RoundoffChecker
     } else {
-      new Checker
+      new Checker with RoundoffChecker
     }
 
     checker.verify(vcs)

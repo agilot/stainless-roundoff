@@ -15,13 +15,23 @@ class AssertionInjector(override val s: ast.Trees, override val t: ast.Trees, va
   extends transformers.ConcreteTreeTransformer(s, t) {
 
   private var inWrappingMode: Boolean = false
+  private var inPrecondMode: Boolean = false
   private def checkOverflow: Boolean = strictArithmetic && !inWrappingMode
+  private def checkNaNComparison: Boolean = checkOverflow && !inPrecondMode
 
   def wrapping[A](enabled: Boolean)(a: => A): A = {
     val old = inWrappingMode
     inWrappingMode = enabled
     val res = a
     inWrappingMode = old
+    res
+  }
+
+  private def inPrecond[A](a: => A): A = {
+    val old = inPrecondMode
+    inPrecondMode = true
+    val res = a
+    inPrecondMode = old
     res
   }
 
@@ -348,11 +358,14 @@ class AssertionInjector(override val s: ast.Trees, override val t: ast.Trees, va
         t.Assert(range, Some("Shift semantics"), recons(rhsx)).copiedFrom(e)
       }
 
-    case s.FPGreaterEquals(e1, e2) if checkOverflow => checkNaNBinop(e)(t.FPGreaterEquals.apply, e1, e2)
-    case s.FPLessEquals(e1, e2) if checkOverflow => checkNaNBinop(e)(t.FPLessEquals.apply, e1, e2)
-    case s.FPGreaterThan(e1, e2) if checkOverflow => checkNaNBinop(e)(t.FPGreaterThan.apply, e1, e2)
-    case s.FPLessThan(e1, e2) if checkOverflow => checkNaNBinop(e)(t.FPLessThan.apply, e1, e2)
-    case s.FPEquals(e1, e2) if checkOverflow => checkNaNBinop(e)(t.FPEquals.apply, e1, e2)
+    case s.FPGreaterEquals(e1, e2) if checkNaNComparison => checkNaNBinop(e)(t.FPGreaterEquals.apply, e1, e2)
+    case s.FPLessEquals(e1, e2) if checkNaNComparison => checkNaNBinop(e)(t.FPLessEquals.apply, e1, e2)
+    case s.FPGreaterThan(e1, e2) if checkNaNComparison => checkNaNBinop(e)(t.FPGreaterThan.apply, e1, e2)
+    case s.FPLessThan(e1, e2) if checkNaNComparison => checkNaNBinop(e)(t.FPLessThan.apply, e1, e2)
+    case s.FPEquals(e1, e2) if checkNaNComparison => checkNaNBinop(e)(t.FPEquals.apply, e1, e2)
+
+    case s.Require(pred, body) =>
+      t.Require(inPrecond(transform(pred)), transform(body)).copiedFrom(e)
 
     case _ => super.transform(e)
   }
