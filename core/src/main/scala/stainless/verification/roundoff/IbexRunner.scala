@@ -38,8 +38,14 @@ class IbexRunner(ctx: inox.Context, recordWitnesses: Boolean) {
   private val feasibilityShare: Double =
     ctx.options.findOptionOrDefault(optRoundoffFeasibilityShare).max(0.0).min(1.0)
 
+  /** Whether a query that cannot be the widest is set aside rather than bracketed. */
+  private val incumbent: Boolean = ctx.options.findOptionOrDefault(optRoundoffIncumbent)
+
   private var deadline: Long = 0L
   private var pending: Int = 0
+
+  /** The widest divergence answered so far, which the ones after it have to beat. */
+  private var widest: BigDecimal = 0
 
   /** Bounds the divergences of one function inside a budget divided among its queries.
     *
@@ -50,7 +56,8 @@ class IbexRunner(ctx: inox.Context, recordWitnesses: Boolean) {
   def within[A](seconds: Double, queries: Int)(block: => A): A = synchronized {
     deadline = System.nanoTime() + (seconds.max(0.0) * 1e9).toLong
     pending = queries
-    try block finally { deadline = 0L; pending = 0 }
+    widest = 0
+    try block finally { deadline = 0L; pending = 0; widest = 0 }
   }
 
   /** What the next query may spend: the time left over the queries left. */
@@ -86,7 +93,7 @@ class IbexRunner(ctx: inox.Context, recordWitnesses: Boolean) {
     * values; further apart than that, the rounded comparison agrees with the exact one.
     */
   def discontinuityBound(problem: DiscontinuityProblem,
-                         guardDifferences: Seq[Expr],
+                         guardDifferences: Seq[Seq[Expr]],
                          guardErrors: Seq[BigDecimal],
                          site: Site): Either[String, BigDecimal] =
     synchronized {
@@ -120,7 +127,7 @@ class IbexRunner(ctx: inox.Context, recordWitnesses: Boolean) {
     * but it costs a query per leaf rather than a query per pair of them.
     */
   def referenceBound(region: DivergenceRegion,
-                     guardDifferences: Seq[Expr],
+                     guardDifferences: Seq[Seq[Expr]],
                      guardErrors: Seq[BigDecimal],
                      site: Site): Either[String, BigDecimal] =
     synchronized {
@@ -162,7 +169,7 @@ class IbexRunner(ctx: inox.Context, recordWitnesses: Boolean) {
     * say which side that was, so both are relaxed by their own guard errors.
     */
   def mergedBound(region: MergedRegion,
-                  guardDifferences: Seq[Expr],
+                  guardDifferences: Seq[Seq[Expr]],
                   guardErrors: Seq[BigDecimal],
                   site: Site): Either[String, BigDecimal] =
     synchronized {
@@ -194,10 +201,11 @@ class IbexRunner(ctx: inox.Context, recordWitnesses: Boolean) {
   /** Where the two readings of one guard part company, which is only where its two sides
     * are within their combined error of each other.
     */
-  private def band(guard: Int, error: BigDecimal, guardDifferences: Seq[Expr]): Seq[Expr] = {
+  private def band(guard: Int, error: BigDecimal, guardDifferences: Seq[Seq[Expr]]): Seq[Expr] = {
     val width = Fraction.literal(roundedUp(error))
-    val difference = guardDifferences(guard)
-    Seq(LessEquals(difference, width), LessEquals(UMinus(difference), width))
+    guardDifferences(guard).flatMap { difference =>
+      Seq(LessEquals(difference, width), LessEquals(UMinus(difference), width))
+    }
   }
 
   /** Runs a block over one region, declared and asserted once for every query inside it. */
@@ -219,19 +227,21 @@ class IbexRunner(ctx: inox.Context, recordWitnesses: Boolean) {
 
   /** How far one divergent path's result can be from this path's, where it is reachable. */
   private def divergenceBound(path: DivergentPath,
-                              guardDifferences: Seq[Expr],
+                              guardDifferences: Seq[Seq[Expr]],
                               guardErrors: Seq[BigDecimal],
                               site: Site): Either[String, Verdict] = {
     val verdict = measure(path.divergingChoices, path.difference, guardDifferences, guardErrors,
                           Witness.infeasible(site, path.toPath),
-                          (maximizing, box) => Witness.bounded(site, path.toPath, maximizing, box))
+                          (maximizing, box) => Witness.bounded(site, path.toPath, maximizing, box),
+                          Witness.dominated(site, path.toPath),
+                          box => Witness.feasible(site, path.toPath, box), compare = true)
     told(site, s"path ${site.region}, divergence to path ${path.toPath}", verdict)
     verdict
   }
 
   /** How far one leaf can be from the reference its region measures against. */
   private def referenceDistance(comparison: ReferenceComparison, reference: Int,
-                                guardDifferences: Seq[Expr],
+                                guardDifferences: Seq[Seq[Expr]],
                                 guardErrors: Seq[BigDecimal],
                                 site: Site): Either[String, Verdict] = {
     val against = Some(reference)
@@ -239,14 +249,19 @@ class IbexRunner(ctx: inox.Context, recordWitnesses: Boolean) {
     val verdict = measure(comparison.choices, comparison.difference, guardDifferences, guardErrors,
                           Witness.infeasible(site, comparison.leaf, against, scheme),
                           (maximizing, box) =>
-                            Witness.bounded(site, comparison.leaf, maximizing, box, against, scheme))
+                            Witness.bounded(site, comparison.leaf, maximizing, box, against, scheme),
+                          Witness.dominated(site, comparison.leaf, against, scheme),
+                          box => Witness.feasible(site, comparison.leaf, box, against, scheme),
+                          // A region measured against a reference adds two of these together,
+                          // so one of them being below the widest says nothing about the sum.
+                          compare = false)
     told(site, s"guard ${site.region}, leaf ${comparison.leaf} against $reference", verdict)
     verdict
   }
 
   /** How far two leaves either side of one guard can be from each other. */
   private def crossDistance(pair: CrossComparison,
-                            guardDifferences: Seq[Expr],
+                            guardDifferences: Seq[Seq[Expr]],
                             guardErrors: Seq[BigDecimal],
                             site: Site): Either[String, Verdict] = {
     val against = Some(pair.taken)
@@ -254,16 +269,22 @@ class IbexRunner(ctx: inox.Context, recordWitnesses: Boolean) {
     val verdict = measure(pair.choices, pair.difference, guardDifferences, guardErrors,
                           Witness.infeasible(site, pair.untaken, against, scheme),
                           (maximizing, box) =>
-                            Witness.bounded(site, pair.untaken, maximizing, box, against, scheme))
+                            Witness.bounded(site, pair.untaken, maximizing, box, against, scheme),
+                          Witness.dominated(site, pair.untaken, against, scheme),
+                          box => Witness.feasible(site, pair.untaken, box, against, scheme),
+                          compare = true)
     told(site, s"guard ${site.region}, leaf ${pair.untaken} across from ${pair.taken}", verdict)
     verdict
   }
 
   /** Brackets one difference over the region narrowed by the branches a path takes. */
   private def measure(choices: Seq[BranchChoice], objective: Expr,
-                      guardDifferences: Seq[Expr], guardErrors: Seq[BigDecimal],
+                      guardDifferences: Seq[Seq[Expr]], guardErrors: Seq[BigDecimal],
                       refused: => Witness,
-                      bounded: (Boolean, Box) => Witness): Either[String, Verdict] = {
+                      bounded: (Boolean, Box) => Witness,
+                      outdone: => Witness,
+                      reached: Box => Witness,
+                      compare: Boolean): Either[String, Verdict] = {
     val budget = slice()
     pending -= 1
 
@@ -271,9 +292,10 @@ class IbexRunner(ctx: inox.Context, recordWitnesses: Boolean) {
     try {
       choices.foreach { choice =>
         val width = Fraction.literal(roundedUp(guardErrors(choice.guard)))
-        val difference = guardDifferences(choice.guard)
-        optimizer.assertCnstr(
-          LessEquals(if (choice.taken) difference else UMinus(difference), width))
+        guardDifferences(choice.guard).foreach { difference =>
+          optimizer.assertCnstr(
+            LessEquals(if (choice.taken) difference else UMinus(difference), width))
+        }
       }
 
       // An empty region means no point of it takes this path, so there is nothing to
@@ -285,17 +307,57 @@ class IbexRunner(ctx: inox.Context, recordWitnesses: Boolean) {
           record(refused)
           Right(Verdict(DivergenceStatus.Infeasible, BigDecimal(0)))
 
+        // The region holds a point, so it is recorded before anything is optimized. That is
+        // what a fuzzer is given to search, and it has to be recorded here: a divergence set
+        // aside below is never bracketed, and would otherwise leave no region to look in.
         case _ =>
-          // Whatever the emptiness check left goes to the two ends, which share it evenly.
-          val each = budget * (1.0 - feasibilityShare) / 2.0
-          for {
-            high <- extremum(objective, maximizing = true, each, bounded)
-            low <- extremum(objective, maximizing = false, each, bounded)
-          } yield Verdict(DivergenceStatus.Bounded, high.abs max low.abs)
+          record(reached(certifiedBox))
+
+          // A divergence narrower than one already answered cannot be the widest, and the
+          // widest is all the function is asked for, so how far this one reaches is never
+          // worked out.
+          if (compare && incumbent && widest > 0 && !reaches(objective, widest, budget)) {
+            record(outdone)
+            Right(Verdict(DivergenceStatus.Dominated, BigDecimal(0)))
+          } else bracket(objective, budget, bounded)
       }
     } finally {
       optimizer.pop()
     }
+  }
+
+  /** How far a difference reaches at either end of the region it is measured over. */
+  private def bracket(objective: Expr, budget: Double,
+                      bounded: (Boolean, Box) => Witness): Either[String, Verdict] = {
+
+    // Whatever the emptiness check left goes to the two ends, which share it evenly.
+    val each = budget * (1.0 - feasibilityShare) / 2.0
+    for {
+      high <- extremum(objective, maximizing = true, each, bounded)
+      low <- extremum(objective, maximizing = false, each, bounded)
+    } yield {
+      val bound = high.abs max low.abs
+      if (bound > widest) widest = bound
+      Verdict(DivergenceStatus.Bounded, bound)
+    }
+  }
+
+  /** Whether the objective can reach `target` at either end, which is a question with a yes or
+    * a no rather than a figure, and so is settled where working the figure out would not be.
+    */
+  private def reaches(objective: Expr, target: BigDecimal, budget: Double): Boolean = {
+    val far = Fraction.literal(target.toDouble)
+
+    def possible(side: Expr): Boolean = {
+      optimizer.push()
+      try {
+        optimizer.assertCnstr(GreaterEquals(side, far))
+        optimizer.setSearchTimeout(budget * feasibilityShare)
+        phases.dominated.run(optimizer.check(Simple)) != Unsat
+      } finally optimizer.pop()
+    }
+
+    possible(objective) || possible(UMinus(objective))
   }
 
   private def extremum(objective: Expr, maximizing: Boolean, budget: Double,
@@ -340,6 +402,7 @@ class IbexRunner(ctx: inox.Context, recordWitnesses: Boolean) {
       s"Ibex on $where: ${verdicts.size} queries, " +
       s"${count(DivergenceStatus.Unreachable)} unreachable, " +
       s"${count(DivergenceStatus.Infeasible)} refuted, " +
+      s"${count(DivergenceStatus.Dominated)} dominated, " +
       s"${count(DivergenceStatus.Bounded)} bounded, worst $worst"
     )(using DebugSectionVerification)
   }

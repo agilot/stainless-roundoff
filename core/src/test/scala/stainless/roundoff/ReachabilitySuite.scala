@@ -121,6 +121,57 @@ class ReachabilitySuite extends AnyFunSuite {
     assert(paths.map(_.leaf) == Seq(one, two, two))
   }
 
+  private val spec = InputSpec(FPPrecision.Binary64,
+                              Map(a.id -> (0.0, 100.0), b.id -> (0.0, 100.0)))
+
+  /** `a < 2.0`, as `PathExtractor` orients it. */
+  private val below = Guard(a, two, strict = true)
+
+  private def narrow(guard: Guard, taken: Boolean): (Double, Double) =
+    FPCoreEmitter.narrowed(spec, Seq(guard), Seq(BranchChoice(0, taken))).ranges(a.id)
+
+  test("taking a guard against a literal caps the input at it") {
+    assert(narrow(below, taken = true) == (0.0, 2.0))
+  }
+
+  test("not taking it floors the input at the literal instead") {
+    assert(narrow(below, taken = false) == (2.0, 100.0))
+  }
+
+  test("a literal on the left narrows the other way round") {
+    val above = Guard(two, a, strict = true)
+    assert(narrow(above, taken = true) == (2.0, 100.0))
+    assert(narrow(above, taken = false) == (0.0, 2.0))
+  }
+
+  test("a guard between two inputs narrows nothing, since neither side is a literal") {
+    val between = Guard(a, b, strict = true)
+    assert(FPCoreEmitter.narrowed(spec, Seq(between), Seq(BranchChoice(0, true))).ranges == spec.ranges)
+  }
+
+  test("a guard on a computed value says nothing about the inputs under it") {
+    val computed = Guard(FPMul(RoundNearestTiesToEven, a, a), two, strict = true)
+    assert(FPCoreEmitter.narrowed(spec, Seq(computed), Seq(BranchChoice(0, true))).ranges == spec.ranges)
+  }
+
+  test("a guard the box already decides leaves the range as it was") {
+    val wide = Guard(a, Float64Literal(500.0), strict = true)
+    assert(narrow(wide, taken = true) == (0.0, 100.0))
+  }
+
+  test("an empty intersection is left alone, since reachability has already asked about it") {
+    val impossible = Guard(a, Float64Literal(-5.0), strict = true)
+    assert(narrow(impossible, taken = true) == (0.0, 100.0))
+  }
+
+  test("nested guards narrow from both sides") {
+    val lower = Guard(Float64Literal(10.0), a, strict = true)
+    val upper = Guard(a, Float64Literal(40.0), strict = true)
+    val both = FPCoreEmitter.narrowed(spec, Seq(lower, upper),
+                                      Seq(BranchChoice(0, true), BranchChoice(1, true)))
+    assert(both.ranges(a.id) == (10.0, 40.0))
+  }
+
   test("refusing the first conjunct cuts the second along with it") {
     val stub = new Stub(refuse = _ == FPLessThan(a, b))
     val body = IfExpr(And(Seq(FPLessThan(a, b), FPLessThan(b, c))), one, two)

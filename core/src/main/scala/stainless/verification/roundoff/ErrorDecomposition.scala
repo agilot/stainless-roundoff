@@ -233,8 +233,8 @@ object DiscontinuityEncoder {
 
   /** The plan, along with `lhs - rhs` for each guard. */
   def apply(guards: Seq[Guard], paths: Seq[ProgramPath], spec: InputSpec,
-            mode: DiscontinuityMode)
-    : Either[String, (Seq[inox.trees.Expr], DiscontinuityPlan)] = {
+            mode: DiscontinuityMode, normalise: Boolean = true)
+    : Either[String, (Seq[Seq[inox.trees.Expr]], DiscontinuityPlan)] = {
 
     val inputs = (paths.map(_.leaf) ++ guards.flatMap(g => Seq(g.lhs, g.rhs)))
       .flatMap(exprOps.variablesOf)
@@ -260,11 +260,40 @@ object DiscontinuityEncoder {
                          } yield (lhs, rhs)
                        }
     } yield {
-      val box = inputs.flatMap { input =>
+      val ranges = inputs.flatMap { input =>
         val (low, high) = spec.ranges(input.id)
         Seq(inox.trees.LessEquals(Fraction.literal(low), realVariables(input.id)),
             inox.trees.LessEquals(realVariables(input.id), Fraction.literal(high)))
       }
+
+      /** What a guard is worth, as written. */
+      val written = guardOperands.map { case (lhs, rhs) => inox.trees.Minus(lhs, rhs) }
+
+      // Each guard difference also becomes a variable of its own, tied to what it stands for by
+      // an equation the region carries. The band is then a range on that variable rather than a
+      // relation between the inputs, which is the difference between reading an objective off
+      // and bisecting towards it.
+      val named: Seq[inox.trees.Variable] =
+        if (!normalise) Seq.empty
+        else guards.indices.map(k =>
+          inox.trees.Variable.fresh(s"guard$k", inox.trees.RealType()))
+
+      // The band goes on both forms rather than only the variable. Stating it on the expression
+      // is what holds the inputs of a region to each other: told only that the variable is small,
+      // the solver satisfies the equation to about a part in a billion and hands back a point
+      // whose inputs are nowhere near the boundary, which is a bound one can trust and a witness
+      // one cannot. Stating it on the variable as well is what lets the objective be read off.
+      val differences: Seq[Seq[inox.trees.Expr]] =
+        if (normalise) written.zip(named).map { case (w, n) => Seq(w, n) }
+        else written.map(Seq(_))
+
+      val box = ranges ++ named.zip(written).map { case (name, difference) =>
+        inox.trees.Equals(name, difference)
+      }
+
+      /** An objective written over the guards it turns out to be made of. */
+      def objective(e: inox.trees.Expr): inox.trees.Expr =
+        if (!normalise) e else Normalisation.rewrite(e, written, named)
 
       /** The path condition one choice contributes. */
       def pathCondition(choice: BranchChoice): inox.trees.Expr = {
@@ -282,7 +311,7 @@ object DiscontinuityEncoder {
       def divergencePoint(one: ProgramPath, other: ProgramPath): Int =
         one.choices.zip(other.choices).indexWhere { case (a, b) => a != b }
 
-      val vars = inputs.map(input => realVariables(input.id).toVal)
+      val vars = inputs.map(input => realVariables(input.id).toVal) ++ named.map(_.toVal)
 
       def pairwise: Seq[DiscontinuityProblem] = paths.zipWithIndex.map { case (path, i) =>
         val divergentPaths = paths.zipWithIndex.collect {
@@ -290,7 +319,7 @@ object DiscontinuityEncoder {
           // a leaf no run reaches, since the rounded program never lands there.
           case (other, j) if j != i && other.leaf != path.leaf && other.reachable =>
             DivergentPath(j, other.choices.drop(divergencePoint(path, other)),
-                          inox.trees.Minus(leaves(j), leaves(i)))
+                          objective(inox.trees.Minus(leaves(j), leaves(i))))
         }
         DiscontinuityProblem(vars, box ++ path.choices.map(pathCondition), divergentPaths)
       }
@@ -326,7 +355,7 @@ object DiscontinuityEncoder {
             // reference is no distance from itself.
             Option.when(leaf != reference && path.leaf != paths(reference).leaf)(
               ReferenceComparison(leaf, path.choices.drop(at(path) + 1),
-                                  inox.trees.Minus(leaves(leaf), leaves(reference))))
+                                  objective(inox.trees.Minus(leaves(leaf), leaves(reference)))))
           }
 
           DivergenceRegion(guard, vars, shared, reference,
@@ -344,7 +373,7 @@ object DiscontinuityEncoder {
           } yield CrossComparison(
             one, other,
             onePath.choices.drop(at(onePath) + 1) ++ otherPath.choices.drop(at(otherPath) + 1),
-            inox.trees.Minus(leaves(other), leaves(one)))
+            objective(inox.trees.Minus(leaves(other), leaves(one))))
 
           MergedRegion(guard, vars, shared, crossings)
         }
@@ -356,7 +385,7 @@ object DiscontinuityEncoder {
         case DiscontinuityMode.Reference => DiscontinuityPlan.ViaReference(viaReference)
       }
 
-      (guardOperands.map { case (lhs, rhs) => inox.trees.Minus(lhs, rhs) }, plan)
+      (differences, plan)
     }
   }
 }
@@ -471,7 +500,7 @@ enum RoundingError {
 case class ErrorDecomposition(
   leaves: Seq[RoundingError],
   guardOperandErrors: Seq[(RoundingError, RoundingError)],
-  guardDifferences: Seq[inox.trees.Expr],
+  guardDifferences: Seq[Seq[inox.trees.Expr]],
   discontinuities: DiscontinuityPlan,
   spec: InputSpec,
   body: Expr
@@ -495,7 +524,9 @@ object ErrorDecomposition {
     */
   def of(fd: FunDef, exactInputs: Boolean, mode: DiscontinuityMode,
          oracle: BranchOracle = BranchOracle.open,
-         timers: inox.utils.TimerStorage = inox.utils.TimerStorage())(using Symbols)
+         timers: inox.utils.TimerStorage = inox.utils.TimerStorage(),
+         normalise: Boolean = true,
+         pathRanges: Boolean = true)(using Symbols)
     : Either[String, ErrorDecomposition] =
     for {
       body <- timers.preprocessing.run(Preprocessor(fd))
@@ -509,17 +540,23 @@ object ErrorDecomposition {
              "no path through this function is reachable, so its precondition may be " +
              "unsatisfiable; --sat-precond checks that on its own")
 
+      // The ranges each leaf is bounded over, which the guards above it can narrow.
+      leafSpecs = paths.map(path =>
+                    if (pathRanges) FPCoreEmitter.narrowed(spec, guards, path.choices) else spec)
+
       // A connective written out as nesting repeats what it guards, so one expression can
-      // appear on several paths and only needs analyzing once.
-      leafNames = paths.map(_.leaf).distinct.zipWithIndex.toMap
+      // appear on several paths and only needs analyzing once. What is asked about is the
+      // expression over a range, so two paths share a query only where both agree.
+      leafKeys = paths.map(_.leaf).zip(leafSpecs.map(_.ranges))
+      leafNames = leafKeys.distinct.zipWithIndex.toMap
       guardNames = guards.distinct.zipWithIndex.toMap
 
-      leaves <- timers.queries.branches.run(traverse(paths) { path =>
-                  if (!path.reachable) Right(RoundingError.Unreachable)
+      leaves <- timers.queries.branches.run(traverse(paths.indices) { i =>
+                  if (!paths(i).reachable) Right(RoundingError.Unreachable)
                   else {
-                    val k = leafNames(path.leaf)
+                    val k = leafNames(leafKeys(i))
                     errorOf(fd, s"${prefix(fd)}_leaf$k", s"${fd.id.name} (leaf ${k + 1})",
-                            path.leaf, spec, exactInputs)
+                            paths(i).leaf, leafSpecs(i), exactInputs)
                   }
                 })
       operandErrors <- timers.queries.conditions.run(traverse(guards) { guard =>
@@ -535,9 +572,10 @@ object ErrorDecomposition {
                        })
       // Without guards there is no other path to take, so no region has to be built.
       (differences, plan) <- if (guards.isEmpty)
-                               Right((Seq.empty, DiscontinuityPlan.Pairwise(Seq.empty)))
+                               Right((Seq.empty[Seq[inox.trees.Expr]],
+                                      DiscontinuityPlan.Pairwise(Seq.empty)))
                              else timers.encoding.run(
-                                    DiscontinuityEncoder(guards, paths, spec, mode))
+                                    DiscontinuityEncoder(guards, paths, spec, mode, normalise))
     } yield ErrorDecomposition(leaves, operandErrors, differences, plan, spec, body)
 
   private def errorOf(fd: FunDef, name: String, label: String, expr: Expr, spec: InputSpec,

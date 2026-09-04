@@ -8,7 +8,7 @@ object SoftThreshold {
   private def shrink(value: Double, amount: Double): Double =
     if (value * value < amount) value * 0.1 else value - amount
 
-  @roundoff
+  @roundoff @ fuzz
   def denoise(a: Double, b: Double, amount: Double): Double = {
     require(0.1 <= a && a <= 10.0)
     require(0.1 <= b && b <= 10.0)

@@ -51,6 +51,12 @@ trait RoundoffChecker extends VerificationChecker {
   private lazy val exactInputs: Boolean =
     context.options.findOptionOrDefault(optRoundoffExactInputs)
 
+  private lazy val pathRanges: Boolean =
+    context.options.findOptionOrDefault(optRoundoffPathRanges)
+
+  private lazy val normalise: Boolean =
+    context.options.findOptionOrDefault(optRoundoffNormalisation)
+
   private lazy val mode: DiscontinuityMode =
     context.options.findOptionOrDefault(optRoundoffDiscontinuity)
 
@@ -70,7 +76,8 @@ trait RoundoffChecker extends VerificationChecker {
     annotated.map { fd =>
       val start = System.nanoTime()
       val outcome = withOracle(fd) { oracle =>
-        ErrorDecomposition.of(fd, exactInputs, mode, oracle, phases)(using program.symbols)
+        ErrorDecomposition.of(fd, exactInputs, mode, oracle, phases, normalise, pathRanges)(
+          using program.symbols)
       }
       (fd.id, (System.nanoTime() - start) / 1000000, outcome)
     }
@@ -358,6 +365,7 @@ trait RoundoffChecker extends VerificationChecker {
         reporter.debug(
           s"Roundoff for ${getFunction(fid).id.asString} (${mode.toString.toLowerCase}): " +
           s"${parts.leaves.size} paths of which ${parts.unreachableCount} unreachable, " +
+          s"${parts.queries.map(_.name).distinct.size} analyzer queries, " +
           s"${parts.discontinuities.size} regions of which " +
           s"${bounds.count(_ > 0)} hold a divergence, " +
           s"worst discontinuity $worstDiscontinuity, worst rounding $worstRounding"

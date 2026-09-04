@@ -50,6 +50,32 @@ package object roundoff {
     */
   object optRoundoffExactInputs extends inox.FlagOptionDef("roundoff-exact-inputs", false)
 
+  /** Whether a divergence that cannot be the widest one is bounded anyway.
+    *
+    * The error of a function is the widest of its divergences, so a query that cannot reach as
+    * far as one already answered needs no figure of its own. Asking whether it can is a plain
+    * satisfiability question and is settled quickly where the answer is no, which saves the two
+    * searches that would otherwise bracket it.
+    */
+  object optRoundoffIncumbent extends inox.FlagOptionDef("roundoff-incumbent", true)
+
+  /** Whether a leaf is bounded over the inputs that reach it rather than over every input.
+    *
+    * A guard between an input and a literal holds that input to one side of it, so a leaf below
+    * the guard never runs anywhere else and the analyzer can be told so. It only ever narrows a
+    * box, so it can only tighten what comes back.
+    */
+  object optRoundoffPathRanges extends inox.FlagOptionDef("roundoff-path-ranges", true)
+
+  /** Whether an objective is rewritten over the guards it turns out to be made of.
+    *
+    * Ibex searches a box, and a box cannot hold the fact that two variables are nearly equal, so
+    * the band a divergence lives in is invisible while the objective is being read. Naming each
+    * guard difference and rewriting the objective over those names puts the band where the
+    * solver can see it. Where nothing matches, the objective goes over as it was written.
+    */
+  object optRoundoffNormalisation extends inox.FlagOptionDef("roundoff-normalisation", true)
+
   /** How long the divergence queries of one function may take, all told.
     *
     * A budget rather than an allowance per query, because the queries of one function differ
@@ -166,6 +192,15 @@ package object roundoff {
 
     /** Ibex bracketed how far it moves the result, narrowing a box on the way. */
     case Bounded extends DivergenceStatus("bounded")
+
+    /** Ibex found a point of the region, which is all that was asked of it there. */
+    case Feasible extends DivergenceStatus("feasible")
+
+    /** Ibex showed it cannot reach as far as a divergence already found, so how far it does
+      * reach was never worked out. The error of a function is the widest of its divergences,
+      * so one that cannot be the widest needs no figure of its own.
+      */
+    case Dominated extends DivergenceStatus("dominated")
   }
 
   /** What one divergence query established.
@@ -196,6 +231,24 @@ package object roundoff {
                    scheme: DiscontinuityMode = DiscontinuityMode.Pairwise): Witness =
       Witness(site.function, site.region, other, against, scheme,
               DivergenceStatus.Infeasible, None, None)
+
+    def dominated(site: Site, other: Int, against: Option[Int] = None,
+                  scheme: DiscontinuityMode = DiscontinuityMode.Pairwise): Witness =
+      Witness(site.function, site.region, other, against, scheme,
+              DivergenceStatus.Dominated, None, None)
+
+    /** A point of the region, found by asking whether it holds one rather than how far a
+      * difference reaches inside it.
+      *
+      * It carries no direction because none was asked for, and it sits nearer the boundary than
+      * either end does: an optimum is pulled to the outer face of the band, since the difference
+      * between two leaves grows with the guard difference the band is drawn around, while a
+      * satisfying point has nothing pulling it anywhere.
+      */
+    def feasible(site: Site, other: Int, box: Box, against: Option[Int] = None,
+                 scheme: DiscontinuityMode = DiscontinuityMode.Pairwise): Witness =
+      Witness(site.function, site.region, other, against, scheme,
+              DivergenceStatus.Feasible, None, Some(box))
 
     def bounded(site: Site, other: Int, maximizing: Boolean, box: Box,
                 against: Option[Int] = None,

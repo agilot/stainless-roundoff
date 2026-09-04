@@ -97,6 +97,65 @@ object FPCoreEmitter {
       InputSpec(precision, ranges)
     }
 
+  /** The ranges of `spec`, narrowed by whatever the guards a path took say about an input.
+    *
+    * Only a guard between an input and a literal is read. Such a comparison is exact, since both
+    * sides are already the doubles they name, so the branch really does hold the input to one
+    * side of the literal and a leaf below it is never evaluated anywhere else. A guard on a
+    * computed value says nothing about any input on its own and is passed over.
+    *
+    * A strict comparison is kept as a closed bound, which is wider than the truth by the last
+    * value and keeps the box a box.
+    */
+  def narrowed(spec: InputSpec, guards: Seq[Guard], choices: Seq[BranchChoice]): InputSpec = {
+    val ranges = choices.foldLeft(spec.ranges) { case (ranges, choice) =>
+      val guard = guards(choice.guard)
+
+      // Taking a guard puts its left side below its right, and not taking it puts the right at
+      // or below the left, since an input compared against a literal is never NaN. `capped`
+      // says whether the literal becomes the input's ceiling or its floor.
+      val bound: Option[(Identifier, Boolean, Double)] =
+        (resolved(guard.lhs), resolved(guard.rhs)) match {
+          case (Input(id), Literal(d)) => Some((id, choice.taken, d))
+          case (Literal(d), Input(id)) => Some((id, !choice.taken, d))
+          case _ => None
+        }
+
+      bound match {
+        case Some((id, capped, d)) if ranges.contains(id) =>
+          val (low, high) = ranges(id)
+          val (tightLow, tightHigh) =
+            if (capped) (low, math.min(high, d)) else (math.max(low, d), high)
+
+          // An empty range means no input reaches the leaf, which is a question the enumeration
+          // has already asked; here it only says there is nothing left to narrow.
+          if (tightLow <= tightHigh) ranges.updated(id, (tightLow, tightHigh)) else ranges
+
+        case _ => ranges
+      }
+    }
+
+    spec.copy(ranges = ranges)
+  }
+
+  /** An operand with its bindings written out, since a guard keeps the ones it needs. */
+  private def resolved(e: Expr): Expr = e match {
+    case Let(vd, value, body) =>
+      resolved(exprOps.replaceFromSymbols(Map(vd -> resolved(value)), body))
+    case other => other
+  }
+
+  private object Literal {
+    def unapply(e: Expr): Option[Double] = FPLit.unapply(e)
+  }
+
+  private object Input {
+    def unapply(e: Expr): Option[Identifier] = e match {
+      case v: Variable => Some(v.id)
+      case _ => None
+    }
+  }
+
   /** Writes `expr` as a self-contained FPCore definition called `name`. */
   def emit(name: String, label: String, expr: Expr, spec: InputSpec)(using Symbols)
     : Either[String, String] = {

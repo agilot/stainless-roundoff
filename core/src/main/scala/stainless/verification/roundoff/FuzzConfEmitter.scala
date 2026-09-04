@@ -55,7 +55,7 @@ object FuzzConfEmitter {
   }
 
   private def nameOf(w: Witness): String = {
-    val objective = if (w.maximizing.getOrElse(true)) "max" else "min"
+    val objective = w.maximizing.map(if (_) "max" else "min").getOrElse("any")
     val taken = w.against.map(against => s"_t$against").getOrElse("")
     s"g${w.region}_u${w.other}${taken}_$objective"
   }
