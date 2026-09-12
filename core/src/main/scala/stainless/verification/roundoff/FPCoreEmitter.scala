@@ -85,16 +85,48 @@ object FPCoreEmitter {
 
   private object Bounds { val empty = Bounds(None, None) }
 
-  /** Reads what every query about `fd` shares: its precision, and its input ranges. */
-  def specOf(fd: FunDef, body: Expr)(using Symbols): Either[String, InputSpec] =
+  /** Reads what every query about `fd` shares: its precision, and its input ranges.
+    *
+    * A range can be written in either of two places and they are read as one. A function says what
+    * it takes in its own precondition; a class says what its fields hold in its invariant, and a
+    * function given one of those objects is entitled to both. The invariant is not folded into the
+    * precondition by the time this runs, so it is fetched from the type and instantiated here.
+    */
+  def specOf(fd: FunDef, body: Expr, flattening: Flattening)(using Symbols)
+    : Either[String, InputSpec] =
     for {
       precision <- uniformPrecision(body)
     } yield {
-      val bounds = fd.precondition.map(Preprocessor.stripAnnotations).map(extractRanges).getOrElse(Map.empty)
+      val bounds = extractRanges(assumptions(fd, flattening))
       // A half-open range is no more usable than a missing one, and dropping it here lets
       // `emit` name the input that is missing one.
       val ranges = bounds.collect { case (id, Bounds(Some(low), Some(high))) => id -> (low, high) }
       InputSpec(precision, ranges)
+    }
+
+  /** Everything a function may take for granted about what it was given, as one expression over
+    * the values its fields became.
+    */
+  def assumptions(fd: FunDef, flattening: Flattening)(using Symbols): Expr = {
+    val stated = fd.precondition.map(Preprocessor.stripAnnotations).toSeq ++ invariants(flattening)
+    flattening.substitute(andJoin(stated))
+  }
+
+  /** What every object a field is read through promises about itself.
+    *
+    * Only the objects actually passed through are asked, so a type that holds one of its own kind
+    * is followed exactly as far as the body reads it. Assuming an invariant is sound: Stainless
+    * discharges it wherever such a value is built.
+    */
+  private def invariants(flattening: Flattening)(using symbols: Symbols): Seq[Expr] =
+    flattening.objects.flatMap { obj =>
+      obj.getType match {
+        case adt: ADTType =>
+          adt.getSort.invariant.flatMap { inv =>
+            exprOps.withoutSpecs(inv.fullBody).map(inv.withParamSubst(Seq(obj), _))
+          }
+        case _ => None
+      }
     }
 
   /** The ranges of `spec`, narrowed by whatever the guards a path took say about an input.
@@ -220,6 +252,9 @@ object FPCoreEmitter {
         case Not(Not(e)) => rec(e, constants)
 
         case Let(vd, Constant(d), body) => rec(body, constants + (vd.id -> d))
+        // A binding of one name to another is followed, so that a bound written about the
+        // temporary is recorded against the value it stands for rather than against nothing.
+        case Let(vd, v: Variable, body) => rec(exprOps.replaceFromSymbols(Map(vd -> v), body), constants)
         case Let(_, _, body) => rec(body, constants)
 
         case FPLessEquals(Constant(d), Input(id))    => low(id, d)

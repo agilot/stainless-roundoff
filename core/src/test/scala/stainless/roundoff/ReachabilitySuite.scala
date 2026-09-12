@@ -42,6 +42,35 @@ class ReachabilitySuite extends AnyFunSuite {
     : (Seq[Guard], Seq[ProgramPath]) =
     PathExtractor(body, oracle).fold(why => fail(why), identity)
 
+  test("an equality is the two comparisons that make it, so it marks two bands") {
+    val (guards, paths) = extract(IfExpr(FPEquals(a, b), one, two), BranchOracle.open)
+
+    assert(guards == Seq(Guard(a, b, strict = false), Guard(b, a, strict = false)))
+    // The else branch is reached either way of the band, which is what a conjunction written
+    // out as nesting always does, so it appears once per side.
+    assert(paths.map(_.leaf) == Seq(one, two, two))
+    assert(paths.map(_.choices.map(_.taken)) ==
+             Seq(Seq(true, true), Seq(true, false), Seq(false)))
+  }
+
+  test("an inequality is that same pair with the branches the other way about") {
+    val (guards, paths) = extract(IfExpr(Not(FPEquals(a, b)), one, two), BranchOracle.open)
+
+    assert(guards == Seq(Guard(a, b, strict = false), Guard(b, a, strict = false)))
+    assert(paths.map(_.leaf) == Seq(two, one, one))
+  }
+
+  test("a branch refused above an equality cuts both of its guards at once") {
+    val stub = new Stub(refuse = _ == FPLessThan(a, b))
+    val (_, paths) = extract(IfExpr(FPLessThan(a, b), IfExpr(FPEquals(b, c), one, two), three),
+                             stub)
+
+    assert(paths.count(_.reachable) == 1)
+    assert(paths.filter(_.reachable).map(_.leaf) == Seq(three))
+    // Nothing below the refusal is asked about, so only the outer guard's two sides are.
+    assert(stub.asked.size == 2)
+  }
+
   test("refusing nothing leaves every path the body spells out") {
     val (guards, paths) = extract(nested, BranchOracle.open)
 

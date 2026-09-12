@@ -19,6 +19,23 @@ trait BranchOracle {
     * Only a refutation may answer `None`: a question left open has to keep the branch.
     */
   def assuming[A](condition: Expr)(block: => A): Option[A]
+
+  /** Says what the function's values are and what may be taken for granted about them.
+    *
+    * Told before anything is asked. The values are what the fields a function reads became, so an
+    * oracle never has to reason about an object, and the assumptions are the precondition and the
+    * invariants together, over those same values.
+    */
+  def knowing(values: Seq[ValDef], assumptions: Expr): Unit = ()
+
+  /** Says how many questions there will be at most, so a budget can be cut among them.
+    *
+    * By name, because working the figure out means walking the body once more and an oracle
+    * that refutes nothing has no use for it. An over-estimate is the honest answer: a question
+    * below a refuted branch is never asked, and how many those are is not known until they are
+    * not asked.
+    */
+  def expecting(questions: => Int): Unit = ()
 }
 
 object BranchOracle {

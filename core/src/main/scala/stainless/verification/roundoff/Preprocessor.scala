@@ -8,19 +8,61 @@ import trees._
 
 object Preprocessor {
 
-  def apply(fd: FunDef)(using Symbols): Either[String, Expr] =
+  /** The body as the analysis reads it, one expression per number in the result.
+    *
+    * Everything up to the projection is done once: the paths of a result are read off the same
+    * computation however it is taken apart, so inlining, flattening and lifting are shared and
+    * only the last step differs. Projecting is the fold again, on a selector at the root, which
+    * pushes it down the bindings and branches until it meets the constructors at the leaves.
+    */
+  def apply(fd: FunDef)(using Symbols)
+    : Either[String, (Expr, Seq[ResultPath], Flattening)] =
     for {
       raw <- exprOps.withoutSpecs(fd.fullBody).toRight("function has no body")
       // Calls come out first, so that a conditional or a selection arriving from a
       // callee meets the same rewrites as one written here.
       called <- inlineCalls(raw)
-      body = liftConditionals(unfoldSelections(stripAnnotations(called)))
-      _ <- isUnsupported(body).toLeft(())
-      // Lifting leaves none behind, and one left behind would be measured as rounding
-      // alone, which understates the error.
-      _ <- Either.cond(!branchesInsideExpression(body), (),
-             "a conditional remains inside an expression")
-    } yield body
+      // A thing built and taken apart again is what it was built from. Done before the fields,
+      // so that one read off a constructor is followed to whatever the constructor was given.
+      built = foldConstructors(stripAnnotations(called))
+      // Then the fields, so that what follows only ever sees values. After inlining, since a
+      // callee reads its own name for an object; before the rest, since they know no fields.
+      read <- Flattening.of(fd, built)
+      (fields, flattening) = read
+      // And again once conditionals are lifted: a selector that sat on a branch now sits on each
+      // of its sides, where each side is a constructor of its own.
+      whole = foldConstructors(liftConditionals(unfoldSelections(fields)))
+
+      paths = ResultPath.of(fd.returnType)
+      _ <- Either.cond(paths.nonEmpty, (), ResultPath.refusal(fd.returnType))
+
+      // Checked one field at a time, since what the analysis can read is a number's own
+      // computation and the constructor holding it is not part of that.
+      _ <- traverse(paths) { path =>
+             val body = project(whole, path)
+             for {
+               _ <- isUnsupported(body).toLeft(())
+               // Lifting leaves none behind, and one left behind would be measured as
+               // rounding alone, which understates the error.
+               _ <- Either.cond(!branchesInsideExpression(body), (),
+                      "a conditional remains inside an expression")
+             } yield ()
+           }
+    } yield (whole, paths, flattening)
+
+  /** `e` narrowed to one number of the result it computes.
+    *
+    * The selector is pushed down the bindings and the branches until it meets the constructors
+    * at the leaves, which is the fold that already reads a field off an object built and taken
+    * apart again — here with the taking apart supplied rather than written.
+    */
+  def project(e: Expr, path: ResultPath)(using Symbols): Expr =
+    if (path.steps.isEmpty) e else foldConstructors(path.select(e))
+
+  private def traverse[A, B](xs: Seq[A])(f: A => Either[String, B]): Either[String, Seq[B]] =
+    xs.foldLeft(Right(Vector.empty): Either[String, Vector[B]]) { (acc, x) =>
+      for { done <- acc; next <- f(x) } yield done :+ next
+    }
 
   def stripAnnotations(e: Expr): Expr = exprOps.postMap {
     case Assert(_, _, body) => Some(body)
@@ -89,6 +131,74 @@ object Preprocessor {
     }
 
     rec(e)
+  }
+
+  /** Reads a thing written and immediately taken apart again as what it was written from.
+    *
+    * Imperative code arrives in this shape. Assigning to a variable on both sides of a conditional
+    * is encoded as the two sides handing back what changed, read off by position, and a callee
+    * returning several values does the same. Neither is a computation of its own: the value asked
+    * for is one of the operands the constructor was given.
+    */
+  private def foldConstructors(e: Expr)(using symbols: Symbols): Expr = {
+
+    def rec(e: Expr, built: Map[Identifier, Expr]): Expr = {
+      // What is read arrives under whatever the bindings and branches on the way to it left
+      // there, so the reading is carried inside until it meets what it reads. The bindings it
+      // passes on the way are added to the ones it knows, since a value written down a line
+      // above and named on the next is reached through its own name.
+      def through(e: Expr, known: Map[Identifier, Expr])
+                 (read: Expr => Option[Expr]): Option[Expr] = e match {
+        case Let(vd, value, body) =>
+          through(body, known + (vd.id -> value))(read).map(Let(vd, value, _))
+        case IfExpr(condition, thenBranch, elseBranch) =>
+          for {
+            taken <- through(thenBranch, known)(read)
+            untaken <- through(elseBranch, known)(read)
+          } yield IfExpr(condition, taken, untaken)
+        case v: Variable => known.get(v.id).flatMap(through(_, known)(read))
+        case other => read(other)
+      }
+
+      /** What a reading found, tidied: the bindings it made unnecessary are gone.
+        *
+        * Going round again is what drops them, and it terminates because a reading that found
+        * something returns a smaller tree than it was given.
+        */
+      def folded(found: Option[Expr], otherwise: => Expr): Expr =
+        found.map(rec(_, built)).getOrElse(otherwise)
+
+      e match {
+        case TupleSelect(receiver, index) =>
+          val target = rec(receiver, built)
+          folded(through(target, built) {
+            case Tuple(fields) => Some(fields(index - 1))
+            case _ => None
+          }, TupleSelect(target, index))
+
+        case ADTSelector(receiver, field) =>
+          val target = rec(receiver, built)
+          folded(through(target, built) {
+            case ADT(id, _, fields) =>
+              Option.when(symbols.getConstructor(id).fields.exists(_.id == field))(
+                fields(symbols.getConstructor(id).fields.indexWhere(_.id == field)))
+            case _ => None
+          }, ADTSelector(target, field))
+
+        case Let(vd, value, body) =>
+          val bound = rec(value, built)
+          // Every binding is remembered, and carrying a reading inside one is what decides
+          // whether it meets anything: where it does not, the reading stays where it was.
+          val rest = rec(body, built + (vd.id -> bound))
+          // Whatever was written is now in the places that read it, so the name it was given
+          // has nothing left needing it.
+          if (exprOps.variablesOf(rest).exists(_.id == vd.id)) Let(vd, bound, rest) else rest
+
+        case Operator(operands, build) => build(operands.map(rec(_, built)))
+      }
+    }
+
+    rec(e, Map.empty)
   }
 
   /** Rewrites the operations that pick a value by comparing into the conditional they

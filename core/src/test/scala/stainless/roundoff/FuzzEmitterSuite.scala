@@ -39,7 +39,7 @@ class FuzzEmitterSuite extends AnyFunSuite {
     val fd = new FunDef(FreshIdentifier("denoise"), Seq(), Seq(a.toVal, b.toVal), f64,
                         Require(precondition, body), Seq())
     given Symbols = NoSymbols.withFunctions(Seq(fd))
-    FuzzProgramEmitter.emit(fd, "denoise", spec, body)
+    FuzzProgramEmitter.emit(fd, "denoise", spec, body, fd.params, precondition)
   }
 
   test("a program is marked, and takes its parameters in the order they are declared") {
@@ -67,6 +67,27 @@ class FuzzEmitterSuite extends AnyFunSuite {
     assert("""a_\d+ - \(a_\d+ - b_\d+\)""".r.findFirstIn(source).isDefined, source)
   }
 
+  test("an equality is written as Scala compares two doubles, not as the tree printer shows it") {
+    // The tree printer writes `===`, which tells floating-point equality apart from structural
+    // equality for a reader. What is emitted here is compiled, and `===` is not an operator on
+    // doubles at all.
+    val source = emit(IfExpr(FPEquals(a, b), a, b)).fold(fail(_), identity)
+
+    assert(!source.contains("==="), source)
+    assert("""a_\d+ == b_\d+""".r.findFirstIn(source).isDefined, source)
+  }
+
+  test("an integer among floating-point operands is written as the literal it stands for") {
+    // `x <= 10` on doubles reaches here as a cast, which prints as `10.toDouble`. The
+    // fuzzer promotes the double type and its literals and leaves a cast from an integer
+    // alone, so the two sides of that comparison end up different types.
+    val source = emit(IfExpr(FPLessEquals(a, ToDouble(Int32Literal(10))), a, b))
+                   .fold(fail(_), identity)
+
+    assert(!source.contains("toDouble"), source)
+    assert(source.contains("10.0"), source)
+  }
+
   test("a call the fuzzer cannot promote is refused by name") {
     assert(emit(Sqrt(rm, a)) == Left("'sqrt' has no counterpart in the fuzzer's MPFR build"))
     assert(emit(FPFMA(rm, a, b, a)) ==
@@ -79,7 +100,8 @@ class FuzzEmitterSuite extends AnyFunSuite {
     val fd = new FunDef(FreshIdentifier("f"), Seq(), Seq(x.toVal), single, x, Seq())
     given Symbols = NoSymbols.withFunctions(Seq(fd))
     val narrower = InputSpec(FPPrecision.Binary32, Map(x.id -> (0.0, 1.0)))
-    assert(FuzzProgramEmitter.emit(fd, "f", narrower, x).isLeft)
+    assert(FuzzProgramEmitter.emit(fd, "f", narrower, x, fd.params,
+                                   BooleanLiteral(true)).isLeft)
   }
 
   private val subject = FuzzSubject("denoise", Seq("a", "b"), Seq((0.1, 10.0), (0.5, 2.0)))

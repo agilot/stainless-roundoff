@@ -7,6 +7,17 @@ import stainless.trees._
 
 package object roundoff {
 
+  /** What the analysis was asked to do, and what it found to do it to.
+    *
+    * Kept apart from `verification`, which carries a line per obligation, because this is a
+    * line per function about how the work was shaped rather than about whether it passed.
+    */
+  object DebugSectionRoundoff extends inox.DebugSection("roundoff")
+
+  /** `n` written with the name of what was counted, plural unless there was one of it. */
+  private[roundoff] def counted(n: Int, thing: String, plural: String = ""): String =
+    s"$n ${if (n == 1) thing else if (plural.nonEmpty) plural else thing + "s"}"
+
   /** Path to the Daisy executable */
   object optDaisy extends inox.OptionDef[String] {
     import inox.OptionParsers._
@@ -49,6 +60,15 @@ package object roundoff {
     * a guard between an input and a constant able to diverge; under the first it cannot.
     */
   object optRoundoffExactInputs extends inox.FlagOptionDef("roundoff-exact-inputs", false)
+
+  /** Whether a branch is asked about before it is enumerated.
+    *
+    * A path no input takes is not one a run can round, so leaving it out is what keeps a leaf
+    * behind a condition the precondition already decides from setting the error of the whole
+    * function. Turning this off enumerates every path the body spells out, which is what the
+    * analysis did before it asked.
+    */
+  object optRoundoffPruning extends inox.FlagOptionDef("roundoff-pruning", true)
 
   /** Whether a divergence that cannot be the widest one is bounded anyway.
     *
@@ -94,6 +114,25 @@ package object roundoff {
     val default = 1.0
     val parser = doubleParser
     val usageRhs = "SECONDS"
+  }
+
+  /** What fraction of a function's budget the reachability questions may take together.
+    *
+    * They are cut like the divergence queries that follow them, each offered the time left over
+    * the questions left, so a question settled at once leaves its share to the ones after it.
+    * What the whole phase does not use is not lost either: the queries are given whatever is
+    * left of the budget when they start, so this is a ceiling on pruning rather than a portion
+    * set aside for it.
+    *
+    * A question that runs out of time keeps its branch, which is what an unanswered question
+    * means anyway, so the only thing a small share costs is the refutations that needed longer.
+    */
+  object optRoundoffPruningShare extends inox.OptionDef[Double] {
+    import inox.OptionParsers._
+    val name = "roundoff-pruning-share"
+    val default = 0.2
+    val parser = doubleParser
+    val usageRhs = "0..1"
   }
 
   /** What fraction of a query's share goes on asking whether its region holds any point.

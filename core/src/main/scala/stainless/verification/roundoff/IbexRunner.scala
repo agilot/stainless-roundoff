@@ -41,29 +41,16 @@ class IbexRunner(ctx: inox.Context, recordWitnesses: Boolean) {
   /** Whether a query that cannot be the widest is set aside rather than bracketed. */
   private val incumbent: Boolean = ctx.options.findOptionOrDefault(optRoundoffIncumbent)
 
-  private var deadline: Long = 0L
-  private var pending: Int = 0
+  private var cake: Cake = new Cake(0.0, 0)
 
   /** The widest divergence answered so far, which the ones after it have to beat. */
   private var widest: BigDecimal = 0
 
-  /** Bounds the divergences of one function inside a budget divided among its queries.
-    *
-    * The share is worked out again before each one, from the clock rather than from a plan, so
-    * a query that settles at once leaves the rest of its share to the queries after it and a
-    * query that settles slowly takes only its own.
-    */
+  /** Bounds the divergences of one function inside a budget divided among its queries. */
   def within[A](seconds: Double, queries: Int)(block: => A): A = synchronized {
-    deadline = System.nanoTime() + (seconds.max(0.0) * 1e9).toLong
-    pending = queries
+    cake = new Cake(seconds, queries)
     widest = 0
-    try block finally { deadline = 0L; pending = 0; widest = 0 }
-  }
-
-  /** What the next query may spend: the time left over the queries left. */
-  private def slice(): Double = {
-    val left = (deadline - System.nanoTime()) / 1e9
-    left.max(0.0) / pending.max(1)
+    try block finally { cake = new Cake(0.0, 0); widest = 0 }
   }
 
   private lazy val optimizer: IbexOptimizer { val program: IbexRunner.this.program.type } =
@@ -285,8 +272,8 @@ class IbexRunner(ctx: inox.Context, recordWitnesses: Boolean) {
                       outdone: => Witness,
                       reached: Box => Witness,
                       compare: Boolean): Either[String, Verdict] = {
-    val budget = slice()
-    pending -= 1
+    val budget = cake.slice()
+    cake.taken()
 
     optimizer.push()
     try {

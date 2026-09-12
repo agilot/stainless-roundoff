@@ -1491,8 +1491,18 @@ class TypeChecker(val program: StainlessProgram, val context: inox.Context, val 
             case e => reporter.fatalError(fd.getPos,
               s"@roundoff expects a literal Double bound, got ${e.asString}")
           }
-          buildVC(tcWithPre.withVCKind(VCKind.RoundoffError(bound)),
-            BooleanLiteral(false))
+          // One obligation per number in the result, since the error of several numbers is
+          // several errors. A result that is one number gives one, unlabelled, as before.
+          // Read off the declared type: freshening renames what a body binds, and the names
+          // of a result's fields belong to its type rather than to this function.
+          val fields = roundoff.ResultPath.of(fd.returnType)
+          val labels =
+            if (fields.size <= 1) Seq(None) else fields.map(path => Some(path.label))
+
+          labels.foldLeft(TyperResult.valid) { (built, field) =>
+            built ++ buildVC(tcWithPre.withVCKind(VCKind.RoundoffError(bound, field)),
+                             BooleanLiteral(false))
+          }
       }
 
     // We check that the specification is SAT to avoid false => P(body(x)) type of proofs
@@ -1527,12 +1537,21 @@ class TypeChecker(val program: StainlessProgram, val context: inox.Context, val 
     // beside the bound rather than gating it.
     val trRoundoffFinite: TyperResult =
       if (!fd.flags.exists { case Roundoff(_) => true; case _ => false }) TyperResult.valid
-      else (freshenedReturnType, bodyOpt) match {
-        case (FPType(_, _), Some(body)) =>
-          val res = ValDef.fresh("res", freshenedReturnType)
-          buildVC(tcWithPre.withVCKind(VCKind.RoundoffFinite),
-            Let(res, body, And(Not(FPIsNaN(res.toVariable)), Not(FPIsInfinite(res.toVariable)))))
-        case _ => TyperResult.valid
+      else bodyOpt match {
+        case Some(body) =>
+          // Every number the result holds, so a pair of doubles is asked about as a pair.
+          roundoff.ResultPath.of(freshenedReturnType) match {
+            case Seq() => TyperResult.valid
+            case fields =>
+              val res = ValDef.fresh("res", freshenedReturnType)
+              val finite = fields.map { path =>
+                val at = path.select(res.toVariable)
+                And(Not(FPIsNaN(at)), Not(FPIsInfinite(at)))
+              }
+              buildVC(tcWithPre.withVCKind(VCKind.RoundoffFinite),
+                      Let(res, body, andJoin(finite)))
+          }
+        case None => TyperResult.valid
       }
 
     // The `TypingContext` for the body contains all dependencies, and the measure

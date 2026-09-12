@@ -8,28 +8,23 @@ import java.io.File
 import scala.jdk.CollectionConverters._
 import scala.util.Try
 
-/** Drives the fuzzer as an external process, and reads back the error it observed.
-  *
-  * What comes back is a lower bound: an error the program really made on an input the
-  * fuzzer tried, against the upper bound the analysis proves. The two together bracket the
-  * worst case rather than only capping it.
+/** Drives a fuzzer as an external process to compute a lower bound for the worst-case
+ * roundoff error.
   */
 class FuzzRunner(ctx: inox.Context) {
   import ctx.reporter
 
-  val name = "fuzz"
+  val name = "gavdos"
 
   private val configured = ctx.options.findOptionOrDefault(optFuzz)
 
-  /** Whether a lower bound was asked for at all. */
   val enabled: Boolean = configured.nonEmpty
 
   private lazy val executable: Option[File] = findExecutable(configured)
 
-  /** The widest error the fuzzer saw for each function, or why the run gave nothing.
-    *
-    * @param conf the configuration to search, beside the program it belongs to
-    */
+  /** Runs the fuzzer of each function using a given configuration path and outputs the result
+   * of the fuzzer for each function or an error.
+   */
   def run(conf: File): Either[String, Map[String, BigDecimal]] =
     executable match {
       case None =>
@@ -51,8 +46,7 @@ class FuzzRunner(ctx: inox.Context) {
           val exit = proc.waitFor()
 
           val observed = parse(output)
-          // A run that found nothing has failed at something, and its own last words say
-          // more about what than an exit code does.
+          // A run that found nothing has failed at something.
           if (observed.nonEmpty) Right(observed)
           else Left(s"the fuzzer exited with code $exit and reported no error" +
             lastLine(output).fold("")(l => s": $l"))
@@ -71,10 +65,6 @@ class FuzzRunner(ctx: inox.Context) {
   private val observation = """max abs error\s+(\S+)""".r.unanchored
 
   /** The widest error reported under each function, across all of its configurations.
-    *
-    * The fuzzer writes a heading per function and then a block per configuration, so the
-    * heading last seen says which function a figure belongs to. Public because reading
-    * another tool's output is the brittle half of driving it, and is worth a test.
     */
   def parse(output: String): Map[String, BigDecimal] =
     output.linesIterator.foldLeft((Option.empty[String], Map.empty[String, BigDecimal])) {

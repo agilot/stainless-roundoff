@@ -181,10 +181,12 @@ private[roundoff] object Poly {
   */
 private[roundoff] object Normalisation {
 
-  /** `objective` rewritten over `names`, where `names(k)` stands for `differences(k)`.
+  /** Which guard divides `objective`, and what is left when it is taken out.
     *
-    * Only where a guard divides the whole objective, which is the case worth having: the
+    * Only a guard dividing the whole objective counts, which is the case worth having: the
     * objective is then one product with the band on one side of it, and the solver reads it off.
+    * A guard that divides nothing is never named, since a variable and an equation carried by
+    * every region of a function is paid for whether or not anything reads them.
     *
     * A division that leaves a remainder is refused even though `q * name + r` is just as true.
     * The two halves of it are each far larger than what they add up to, and a box holds no
@@ -192,15 +194,15 @@ private[roundoff] object Normalisation {
     * `Clamp` is the case that says so: rewriting on a remainder took its bound from 1.7e-13 to
     * 1.2, seven hundred thousand times worse for a rewrite that changes nothing about the value.
     */
-  def rewrite(objective: RExpr, differences: Seq[RExpr], names: Seq[RExpr]): RExpr = {
+  def divisor(objective: RExpr, differences: Seq[RExpr]): Option[(Int, RExpr)] = {
     val exact = for {
       whole <- Poly.of(objective).toSeq
-      (difference, name) <- differences.zip(names)
+      (difference, k) <- differences.zipWithIndex
       guard <- Poly.of(difference).filterNot(_.isZero).toSeq
       (quotient, remainder) = Poly.divide(whole, guard)
       if remainder.isZero && !quotient.isZero
-    } yield inox.trees.Times(Poly.toExpr(quotient), name)
+    } yield (k, Poly.toExpr(quotient))
 
-    exact.headOption.getOrElse(objective)
+    exact.headOption
   }
 }

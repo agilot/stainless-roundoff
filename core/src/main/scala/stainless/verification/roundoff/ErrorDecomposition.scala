@@ -59,6 +59,15 @@ object PathExtractor {
           case Or(Seq(single)) => walk(IfExpr(single, thenBranch, elseBranch), inner, choices, live)
           case Not(negated) => walk(IfExpr(negated, elseBranch, thenBranch), inner, choices, live)
 
+          // `a == b` is `a <= b` and `b <= a`, which is the same test on every value a float
+          // takes: both are false where either side is a NaN, and both hold of the two zeros.
+          // Written that way it is two guards rather than none, and each marks a band with a
+          // side either way of it, which is what a divergence is measured across. `a != b` is
+          // the `Not` above and needs nothing of its own.
+          case FPEquals(lhs, rhs) =>
+            walk(IfExpr(And(FPLessEquals(lhs, rhs), FPGreaterEquals(lhs, rhs)),
+                        thenBranch, elseBranch), inner, choices, live)
+
           case BooleanLiteral(true) => walk(thenBranch, inner, choices, live)
           case BooleanLiteral(false) => walk(elseBranch, inner, choices, live)
 
@@ -116,9 +125,6 @@ object PathExtractor {
     case FPLessEquals(l, r)    => Right(Guard(l, r, strict = false))
     case FPGreaterThan(l, r)   => Right(Guard(r, l, strict = true))
     case FPGreaterEquals(l, r) => Right(Guard(r, l, strict = false))
-
-    case FPEquals(_, _) =>
-      Left("the guard tests for equality, which marks no region two paths can be compared over")
 
     case v: Variable =>
       Left(s"the guard is the opaque boolean '${v.id.name}'")
@@ -269,31 +275,71 @@ object DiscontinuityEncoder {
       /** What a guard is worth, as written. */
       val written = guardOperands.map { case (lhs, rhs) => inox.trees.Minus(lhs, rhs) }
 
-      // Each guard difference also becomes a variable of its own, tied to what it stands for by
-      // an equation the region carries. The band is then a range on that variable rather than a
-      // relation between the inputs, which is the difference between reading an objective off
-      // and bisecting towards it.
-      val named: Seq[inox.trees.Variable] =
-        if (!normalise) Seq.empty
-        else guards.indices.map(k =>
-          inox.trees.Variable.fresh(s"guard$k", inox.trees.RealType()))
+      // Which guard, if any, an objective is a multiple of. Memoised because every objective is
+      // a difference of two leaves, and a function has far fewer distinct leaves than paths.
+      val divisors =
+        scala.collection.mutable.Map.empty[inox.trees.Expr, Option[(Int, inox.trees.Expr)]]
+
+      def divisorOf(e: inox.trees.Expr): Option[(Int, inox.trees.Expr)] =
+        if (!normalise) None else divisors.getOrElseUpdate(e, Normalisation.divisor(e, written))
+
+      // A guard difference some objective is made of becomes a variable of its own, tied to what
+      // it stands for by an equation the region carries. The band is then a range on that
+      // variable rather than a relation between the inputs, which is the difference between
+      // reading an objective off and bisecting towards it.
+      //
+      // Only a guard that divides something earns one. The equation is carried by every region
+      // of the function, so naming a guard no objective is written over costs a variable and a
+      // nonlinear constraint per region that nothing ever reads. That is affordable where there
+      // are two or three guards and is the entire cost of the search where there are twenty:
+      // on `OrientationIndexFilter`, twenty-two guards over twenty-two regions took the Ibex
+      // time from 1.5 s to 36 s and bought a bound tighter by a thousandth.
+      val named: Map[Int, inox.trees.Variable] = {
+        val distinct = leaves.distinct
+        val fires = for {
+          reference <- distinct
+          other <- distinct
+          if other != reference
+          (guard, _) <- divisorOf(inox.trees.Minus(other, reference))
+        } yield guard
+
+        fires.distinct.map { guard =>
+          guard -> inox.trees.Variable.fresh(s"guard$guard", inox.trees.RealType())
+        }.toMap
+      }
+
+      /** The named guards, in the order a region declares and equates them. */
+      val naming = named.toSeq.sortBy(_._1)
 
       // The band goes on both forms rather than only the variable. Stating it on the expression
       // is what holds the inputs of a region to each other: told only that the variable is small,
       // the solver satisfies the equation to about a part in a billion and hands back a point
       // whose inputs are nowhere near the boundary, which is a bound one can trust and a witness
       // one cannot. Stating it on the variable as well is what lets the objective be read off.
-      val differences: Seq[Seq[inox.trees.Expr]] =
-        if (normalise) written.zip(named).map { case (w, n) => Seq(w, n) }
-        else written.map(Seq(_))
+      /** The named guard whose difference divides `e`, where there is one. */
+      def overNamed(e: inox.trees.Expr): Option[inox.trees.Expr] =
+        Normalisation.divisor(e, naming.map { case (guard, _) => written(guard) })
+          .map { case (which, quotient) => inox.trees.Times(quotient, naming(which)._2) }
 
-      val box = ranges ++ named.zip(written).map { case (name, difference) =>
-        inox.trees.Equals(name, difference)
+      // A guard that is a multiple of one already named is bounded on that name as well. Two
+      // occurrences of the same quantity are two boxes to the solver, so a band stated on one
+      // of them says nothing about the other: `a * b == c` becomes the two guards `a*b <= c`
+      // and `c <= a*b`, and without this the region of the second bounds an objective written
+      // over the first's variable by bisection, at 0.031 where the truth is 1.3e-15.
+      val differences: Seq[Seq[inox.trees.Expr]] =
+        written.zipWithIndex.map { case (difference, guard) =>
+          Seq(difference) ++ named.get(guard).orElse(overNamed(difference))
+        }
+
+      val box = ranges ++ naming.map { case (guard, name) =>
+        inox.trees.Equals(name, written(guard))
       }
 
-      /** An objective written over the guards it turns out to be made of. */
+      /** An objective written over the guard it turns out to be a multiple of. */
       def objective(e: inox.trees.Expr): inox.trees.Expr =
-        if (!normalise) e else Normalisation.rewrite(e, written, named)
+        divisorOf(e).fold(e) { case (guard, quotient) =>
+          inox.trees.Times(quotient, named(guard))
+        }
 
       /** The path condition one choice contributes. */
       def pathCondition(choice: BranchChoice): inox.trees.Expr = {
@@ -311,7 +357,7 @@ object DiscontinuityEncoder {
       def divergencePoint(one: ProgramPath, other: ProgramPath): Int =
         one.choices.zip(other.choices).indexWhere { case (a, b) => a != b }
 
-      val vars = inputs.map(input => realVariables(input.id).toVal) ++ named.map(_.toVal)
+      val vars = inputs.map(input => realVariables(input.id).toVal) ++ naming.map(_._2.toVal)
 
       def pairwise: Seq[DiscontinuityProblem] = paths.zipWithIndex.map { case (path, i) =>
         val divergentPaths = paths.zipWithIndex.collect {
@@ -491,6 +537,22 @@ enum RoundingError {
   }
 }
 
+/** What the guard tree of a function turned out to look like.
+  *
+  * Everything after enumeration is sized by these figures — how many questions the pruning
+  * budget is cut among, how many regions the search builds, how many comparisons each holds —
+  * so an analysis that took a long time or came out wide is usually explained here rather than
+  * in the search that followed.
+  *
+  * @param guards   comparisons the walk found, after a conjunction or a disjunction has been
+  *                 written out as the nesting it stands for and a call has been inlined
+  * @param paths    leaves, which for a tree of comparisons is `guards + 1`
+  * @param depth    guards above the deepest leaf
+  * @param distinct leaves that compute different things; two paths ending in the same
+  *                 expression are no divergence and are never compared
+  */
+case class Shape(guards: Int, paths: Int, depth: Int, distinct: Int)
+
 /** The parts a function's roundoff error is built from.
   *
   * A run misses the exact result by the rounding along its path plus the distance to the
@@ -499,6 +561,8 @@ enum RoundingError {
   */
 case class ErrorDecomposition(
   leaves: Seq[RoundingError],
+  shape: Shape,
+  flattening: Flattening,
   guardOperandErrors: Seq[(RoundingError, RoundingError)],
   guardDifferences: Seq[Seq[inox.trees.Expr]],
   discontinuities: DiscontinuityPlan,
@@ -527,38 +591,29 @@ object ErrorDecomposition {
          timers: inox.utils.TimerStorage = inox.utils.TimerStorage(),
          normalise: Boolean = true,
          pathRanges: Boolean = true)(using Symbols)
-    : Either[String, ErrorDecomposition] =
+    : Either[String, Seq[(ResultPath, ErrorDecomposition)]] =
     for {
-      body <- timers.preprocessing.run(Preprocessor(fd))
-      spec <- timers.preprocessing.run(FPCoreEmitter.specOf(fd, body))
-      // The questions asked while enumerating are timed inside this, under `paths.pruning`.
-      (guards, paths) <- timers.paths.run(PathExtractor(body, oracle))
+      read <- timers.preprocessing.run(Preprocessor(fd))
+      (whole, fields, flattening) = read
+      spec <- timers.preprocessing.run(FPCoreEmitter.specOf(fd, whole, flattening))
+      _ = oracle.knowing(flattening.parameters, FPCoreEmitter.assumptions(fd, flattening))
+      // Two questions per guard, counted by walking the body once with nothing asked of it.
+      // The walk is the same one that follows and finds the same guards, so the figure is
+      // exact for a run that refutes nothing and an over-estimate for one that does.
+      _ = oracle.expecting(timers.pruning.counting.run(
+            PathExtractor(whole).fold(_ => 0, _._1.size * 2)))
+      // Enumerated once for the whole result. Every number in it is computed by the same
+      // branches, so the guards, the questions asked about them and the errors of their
+      // operands are shared, and only the leaves are read one field at a time.
+      (guards, walked) <- timers.paths.run(PathExtractor(whole, oracle))
 
       // Every leaf refused leaves the function with nothing a run can compute, which is what
       // an unsatisfiable precondition looks like from here.
-      _ <- Either.cond(paths.exists(_.reachable), (),
+      _ <- Either.cond(walked.exists(_.reachable), (),
              "no path through this function is reachable, so its precondition may be " +
              "unsatisfiable; --sat-precond checks that on its own")
 
-      // The ranges each leaf is bounded over, which the guards above it can narrow.
-      leafSpecs = paths.map(path =>
-                    if (pathRanges) FPCoreEmitter.narrowed(spec, guards, path.choices) else spec)
-
-      // A connective written out as nesting repeats what it guards, so one expression can
-      // appear on several paths and only needs analyzing once. What is asked about is the
-      // expression over a range, so two paths share a query only where both agree.
-      leafKeys = paths.map(_.leaf).zip(leafSpecs.map(_.ranges))
-      leafNames = leafKeys.distinct.zipWithIndex.toMap
       guardNames = guards.distinct.zipWithIndex.toMap
-
-      leaves <- timers.queries.branches.run(traverse(paths.indices) { i =>
-                  if (!paths(i).reachable) Right(RoundingError.Unreachable)
-                  else {
-                    val k = leafNames(leafKeys(i))
-                    errorOf(fd, s"${prefix(fd)}_leaf$k", s"${fd.id.name} (leaf ${k + 1})",
-                            paths(i).leaf, leafSpecs(i), exactInputs)
-                  }
-                })
       operandErrors <- timers.queries.conditions.run(traverse(guards) { guard =>
                          val k = guardNames(guard)
                          for {
@@ -570,13 +625,50 @@ object ErrorDecomposition {
                                           guard.rhs, spec, exactInputs)
                          } yield (lhs, rhs)
                        })
-      // Without guards there is no other path to take, so no region has to be built.
-      (differences, plan) <- if (guards.isEmpty)
-                               Right((Seq.empty[Seq[inox.trees.Expr]],
-                                      DiscontinuityPlan.Pairwise(Seq.empty)))
-                             else timers.encoding.run(
-                                    DiscontinuityEncoder(guards, paths, spec, mode, normalise))
-    } yield ErrorDecomposition(leaves, operandErrors, differences, plan, spec, body)
+
+      answered <- traverse(fields) { field =>
+        val paths = walked.map(path =>
+          path.copy(leaf = Preprocessor.project(path.leaf, field)))
+        val named = if (field.steps.isEmpty) fd.id.name else s"${fd.id.name}.${field.label}"
+        val tag = if (field.steps.isEmpty) prefix(fd)
+                  else s"${prefix(fd)}_${field.label.replace('.', '_')}"
+
+        for {
+          // The ranges each leaf is bounded over, which the guards above it can narrow.
+          leafSpecs <- Right(paths.map(path =>
+                         if (pathRanges) FPCoreEmitter.narrowed(spec, guards, path.choices)
+                         else spec))
+
+          // A connective written out as nesting repeats what it guards, so one expression can
+          // appear on several paths and only needs analyzing once. What is asked about is the
+          // expression over a range, so two paths share a query only where both agree.
+          leafKeys = paths.map(_.leaf).zip(leafSpecs.map(_.ranges))
+          leafNames = leafKeys.distinct.zipWithIndex.toMap
+
+          leaves <- timers.queries.branches.run(traverse(paths.indices) { i =>
+                      if (!paths(i).reachable) Right(RoundingError.Unreachable)
+                      else {
+                        val k = leafNames(leafKeys(i))
+                        errorOf(fd, s"${tag}_leaf$k", s"$named (leaf ${k + 1})",
+                                paths(i).leaf, leafSpecs(i), exactInputs)
+                      }
+                    })
+          // Without guards there is no other path to take, so no region has to be built.
+          built <- if (guards.isEmpty)
+                     Right((Seq.empty[Seq[inox.trees.Expr]],
+                            DiscontinuityPlan.Pairwise(Seq.empty)))
+                   else timers.encoding.run(
+                          DiscontinuityEncoder(guards, paths, spec, mode, normalise))
+          (differences, plan) = built
+        } yield field -> ErrorDecomposition(
+          leaves,
+          Shape(guards.size, paths.size,
+                paths.map(_.choices.size).maxOption.getOrElse(0),
+                paths.map(_.leaf).distinct.size),
+          flattening, operandErrors, differences, plan, spec,
+          Preprocessor.project(whole, field))
+      }
+    } yield answered
 
   private def errorOf(fd: FunDef, name: String, label: String, expr: Expr, spec: InputSpec,
                       exactInputs: Boolean)(using Symbols): Either[String, RoundingError] =
