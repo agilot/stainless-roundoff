@@ -470,7 +470,7 @@ private[roundoff] object RealEncoder {
           realBody <- apply(body, realVariables + (vd.id -> realVar))
         } yield inox.trees.Let(realVar.toVal, realValue, realBody)
 
-      case MathCall(f, args) =>
+      case TranscendentalFunctionCall(f, args) =>
         traverse(args)(apply(_, realVariables)).flatMap(realCall(f, _))
 
       case _: IfExpr =>
@@ -483,27 +483,27 @@ private[roundoff] object RealEncoder {
   }
 
   /** The exact counterpart of one call, which only Ibex among the solvers can evaluate. */
-  private def realCall(f: MathFunction, args: Seq[inox.trees.Expr])
+  private def realCall(f: TranscendentalFunction, args: Seq[inox.trees.Expr])
     : Either[String, inox.trees.Expr] = {
     import inox.trees.{FractionLiteral, RealAcos, RealAsin, RealAtan, RealCos, RealExp,
                        RealLog, RealPow, RealSin, RealSqrt, RealTan}
 
     (f, args) match {
-      case (MathFunction.Sqrt, Seq(a)) => Right(RealSqrt(a))
-      case (MathFunction.Exp, Seq(a)) => Right(RealExp(a))
-      case (MathFunction.Log, Seq(a)) => Right(RealLog(a))
-      case (MathFunction.Sin, Seq(a)) => Right(RealSin(a))
-      case (MathFunction.Cos, Seq(a)) => Right(RealCos(a))
-      case (MathFunction.Tan, Seq(a)) => Right(RealTan(a))
-      case (MathFunction.Asin, Seq(a)) => Right(RealAsin(a))
-      case (MathFunction.Acos, Seq(a)) => Right(RealAcos(a))
-      case (MathFunction.Atan, Seq(a)) => Right(RealAtan(a))
+      case (TranscendentalFunction.Sqrt, Seq(a)) => Right(RealSqrt(a))
+      case (TranscendentalFunction.Exp, Seq(a)) => Right(RealExp(a))
+      case (TranscendentalFunction.Log, Seq(a)) => Right(RealLog(a))
+      case (TranscendentalFunction.Sin, Seq(a)) => Right(RealSin(a))
+      case (TranscendentalFunction.Cos, Seq(a)) => Right(RealCos(a))
+      case (TranscendentalFunction.Tan, Seq(a)) => Right(RealTan(a))
+      case (TranscendentalFunction.Asin, Seq(a)) => Right(RealAsin(a))
+      case (TranscendentalFunction.Acos, Seq(a)) => Right(RealAcos(a))
+      case (TranscendentalFunction.Atan, Seq(a)) => Right(RealAtan(a))
 
       // Ibex reads any other exponent as exp(y * log(x)), which holds only where the
       // base is positive, so it refuses one rather than answering on a smaller region.
-      case (MathFunction.Pow, Seq(base, exponent @ FractionLiteral(_, one))) if one == 1 =>
+      case (TranscendentalFunction.Pow, Seq(base, exponent @ FractionLiteral(_, one))) if one == 1 =>
         Right(RealPow(base, exponent))
-      case (MathFunction.Pow, _) =>
+      case (TranscendentalFunction.Pow, _) =>
         Left("a power on a branching path needs a whole-number exponent")
 
       case _ => Left(s"'${f.symbol}' was given ${args.size} arguments")

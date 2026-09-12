@@ -348,7 +348,7 @@ object FPCoreEmitter {
       case FPDiv(mode, l, r) => rounded("/", mode, l, r)
       case FPFMA(mode, a, b, c) => rounded("fma", mode, a, b, c)
       case FPUMinus(a) => convert(a, inScope).map(s => s"(- $s)")
-      case MathCall(f, args) => nary(f.symbol, args)
+      case TranscendentalFunctionCall(f, args) => nary(f.symbol, args)
 
       case Let(vd, value, body) =>
         for {

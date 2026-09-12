@@ -80,7 +80,7 @@ private[roundoff] object ConstantEvaluator {
         bound.get(v.id).toRight(s"'${v.id.name}' is not bound in a value with no inputs")
 
       // The exact side is a fraction, and none of these is one.
-      case MathCall(f, _) =>
+      case TranscendentalFunctionCall(f, _) =>
         Left(s"a value with no inputs calls '${f.symbol}', which is not a fraction")
 
       case other =>

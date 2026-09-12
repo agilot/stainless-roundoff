@@ -87,9 +87,7 @@ object Preprocessor {
     }
 
     def rec(e: Expr): Either[String, Expr] = e match {
-      // The library implements these itself, and the analysis reads each as the exact
-      // function it approximates, so only the arguments are followed.
-      case MathCall(_, _) => descend(e)
+      case TranscendentalFunctionCall(_, _) => descend(e)
       case call: FunctionInvocation => inlined(call)
       case other => descend(other)
     }
@@ -304,7 +302,7 @@ object Preprocessor {
       case Sqrt(mode, a) => isRNE(mode) orElse rec(a)
 
       // The library computes these in Scala, and the analysis reads them as exact instead.
-      case MathCall(_, args) => args.view.flatMap(rec).headOption
+      case TranscendentalFunctionCall(_, args) => args.view.flatMap(rec).headOption
 
       case Let(_, value, body) => rec(value) orElse rec(body)
       case IfExpr(condition, thenBranch, elseBranch) =>

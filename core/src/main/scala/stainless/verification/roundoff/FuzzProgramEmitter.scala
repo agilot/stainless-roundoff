@@ -68,7 +68,7 @@ object FuzzProgramEmitter {
     */
   private def unsupported(e: Expr)(using Symbols): Option[String] =
     exprOps.collect[String] {
-      case MathCall(f, _) => Set(s"'${f.symbol}'")
+      case TranscendentalFunctionCall(f, _) => Set(s"'${f.symbol}'")
       case FPFMA(_, _, _, _) => Set("a fused multiply-add")
       case _ => Set.empty
     }(e).headOption.map(_ + " has no counterpart in the fuzzer's MPFR build")

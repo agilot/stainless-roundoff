@@ -22,281 +22,341 @@ trait RoundoffChecker extends VerificationChecker {
   override def checkVC(vc: VC, origVC: VC,
                        sf: SolverFactory { val program: self.program.type }): VCResult =
     vc.kind match {
-      case VCKind.RoundoffError(bound, field) => checkRoundoff(vc, bound, field)
+      case VCKind.RoundoffError(limit, field) => obligations.answer(vc, limit, field)
       case _ => super.checkVC(vc, origVC, sf)
     }
 
-  /** Ibex runs as a server that outlives a single query, so it is shut down once the
-    * last obligation has been answered rather than after each one.
+  /** Reads every obligation before any of them is answered, since the fuzzer is handed what
+    * all of them found, and shuts Ibex down once the last one has been answered.
     */
   override def verify(vcs: Seq[VC], stopWhen: VCResult => Boolean)
     : scala.concurrent.Future[Map[VC, VCResult]] = {
-    readAll(vcs)
+    obligations.readAll(vcs)
     super.verify(vcs, stopWhen)
       .andThen { case _ => ibex.free() }(using stainless.executionContext(using context))
   }
 
-  /** Reads every roundoff obligation, and then hands what all of them found to the fuzzer.
-    *
-    * The fuzzer searches the regions where a divergence was seen, and one is recorded as each
-    * obligation is read, so it is asked once the last of them has been read rather than once
-    * the first has. The readings are kept, and the obligations answered from them.
-    *
-    * An interrupted run stops reading and answers with what it has, since the obligations it
-    * has yet to read are not going to be answered either.
-    */
-  private def readAll(vcs: Seq[VC]): Unit = {
-    val obligations = vcs.flatMap { vc =>
-      vc.kind match {
-        case VCKind.RoundoffError(_, field) => Some(vc.fid -> field)
-        case _ => None
-      }
-    }
-
-    if (obligations.nonEmpty) {
-      obligations.foreach { case (fid, field) =>
-        if (!interruptManager.isInterrupted) reading(fid, field)
-      }
-
-      // A witness file that cannot be written is not a reason to leave the obligations
-      // unanswered, since every one of them has been read by now.
-      witnessFile.foreach { file =>
-        scala.util.Try(phases.witnesses.run(writeFuzzerInput(file))).failed.foreach(e =>
-          reporter.warning(s"Could not write the divergences to $file: ${e.getMessage}"))
-      }
-
-      val _ = fuzzed
-    }
-  }
-
+  /** Bounds the rounding of a straight-line computation, one batch of queries per run. */
   private lazy val analyzer: RoundingAnalyzer = new DaisyRunner(context)
 
-  /** File containing the regions where divergences may occur */
-  private lazy val witnessFile: Option[java.io.File] =
-    Some(context.options.findOptionOrDefault(optRoundoffWitnesses))
-      .filter(_.nonEmpty)
-      .map(new java.io.File(_))
-
-  /** Fuzzer to detect divergences dynamically and return a lower bound on the worst
-   * case roundoff error.
-   */
+  /** Looks for a divergence by running the program, which bounds the error from below. */
   private lazy val fuzzer = new FuzzRunner(context)
 
+  /** Searches the regions where a guard may be read differently by the two computations. */
   private lazy val ibex =
-    new IbexRunner(context, recordWitnesses = witnessFile.isDefined || fuzzer.enabled)
+    new IbexRunner(context, recordWitnesses = Settings.witnessFile.isDefined || fuzzer.enabled)
 
-  private lazy val exactInputs: Boolean =
-    context.options.findOptionOrDefault(optRoundoffExactInputs)
+  private lazy val phases: inox.utils.TimerStorage = timers.verification.roundoff
 
-  private lazy val prune: Boolean =
-    context.options.findOptionOrDefault(optRoundoffPruning)
-
-  private lazy val pathRanges: Boolean =
-    context.options.findOptionOrDefault(optRoundoffPathRanges)
-
-  private lazy val normalise: Boolean =
-    context.options.findOptionOrDefault(optRoundoffNormalisation)
-
-  private lazy val mode: DiscontinuityMode =
-    context.options.findOptionOrDefault(optRoundoffDiscontinuity)
-
+  /** The `@roundoff` functions, in the order they were declared. */
   private lazy val annotated: Seq[FunDef] =
     program.symbols.functions.values.toSeq
       .filter(_.flags.exists { case Roundoff(_) => true; case _ => false })
       .sortBy(_.id.globalId)
 
-  private lazy val phases: inox.utils.TimerStorage = timers.verification.roundoff
-
-  /** Debug information */
-  private lazy val announced: Unit = {
-    val on = (name: String, flag: Boolean) => if (flag) name else s"no $name"
-    reporter.debug(
-      s"Roundoff settings: ${mode.toString.toLowerCase} discontinuities, " +
-      s"${budget}s per function of which ${(pruningShare * 100).toInt}% for the branch " +
-      s"questions, ${(context.options.findOptionOrDefault(optRoundoffFeasibilityShare) * 100).toInt}% " +
-      s"of a search for feasibility, " +
-      Seq(on("pruning", prune), on("normalisation", normalise), on("path ranges", pathRanges),
-          on("incumbent", context.options.findOptionOrDefault(optRoundoffIncumbent)),
-          if (exactInputs) "exact inputs" else "rounded inputs").mkString(", ") +
-      s", solvers ${context.options.findOptionOrDefault(inox.optSelectedSolvers).mkString(",")}"
-    )(using DebugSectionRoundoff)
-  }
-
-  /** TO REVIEW */
-  private lazy val analysed
-    : Seq[(Identifier, Long, Either[String, Seq[(ResultPath, ErrorDecomposition)]])] =
-    annotated.map { fd =>
-      announced
-      val start = System.nanoTime()
-      val outcome = withOracle(fd) { oracle =>
-        ErrorDecomposition.of(fd, exactInputs, mode, oracle, phases, normalise, pathRanges)(
-          using program.symbols)
-      }
-      (fd.id, (System.nanoTime() - start) / 1000000, outcome)
-    }
-
-  /**
-   *  TO REVIEW
-   * What was made of each function: one decomposition per number in its result.
-    *
-    * A result that is one number gives one, under the empty path. A tuple or a case class gives
-    * one per number anywhere inside it, all over the same guards, since an error of several
-    * numbers is several errors and not one.
-    */
-  private lazy val decompositions
-    : Map[Identifier, Either[String, Seq[(ResultPath, ErrorDecomposition)]]] =
-    analysed.map { case (id, _, outcome) => id -> outcome }.toMap
-
-  /** One field's decomposition, by the label the obligation was raised under. */
-  private def decompositionOf(fid: Identifier, field: Option[String])
-    : Either[String, ErrorDecomposition] =
-    decompositions.getOrElse(fid, Left("this function was not analyzed")).flatMap { fields =>
-      fields.find { case (path, _) => field.forall(_ == path.label) }
-        .map { case (_, parts) => parts }
-        .toRight(s"nothing in the result of this function is called '${field.getOrElse("")}'")
-    }
-
-  /** The first decomposition of a function, which is all of it where the result is one number. */
-  private def firstOf(fid: Identifier): Either[String, ErrorDecomposition] =
-    decompositionOf(fid, None)
-
-  /** How many numbers a function's result holds, as far as it was read. */
-  private def fieldsOf(fid: Identifier): Int =
-    decompositions.get(fid).flatMap(_.toOption).map(_.size).getOrElse(1)
-
-  /** How one obligation reads: the function, and the field where the result holds several. */
+  /** How an obligation reads: the function, and the field where a result holds several numbers. */
   private def label(fid: Identifier, field: Option[String]): String =
     field.filter(_.nonEmpty).fold(getFunction(fid).id.name)(f => s"${getFunction(fid).id.name}.$f")
 
-  /** How long everything before the divergence queries took, for each function.
-    *
-    * The budget is net of this, so that it bounds the analysis of a function rather than only
-    * its search. What the analyzer takes is not counted: it answers one batch for every
-    * function at once, and there is no honest way to charge that to any one of them.
-    */
-  private lazy val spentOn: Map[Identifier, Long] =
-    analysed.map { case (id, spent, _) => id -> spent }.toMap
+  /** Reads each obligation, then answers it from its reading and from what the fuzzer found. */
+  private object obligations {
 
-  private lazy val budget: Double = context.options.findOptionOrDefault(optRoundoffTimeout)
-
-  /** What fraction of a function's budget its reachability questions may take together. */
-  private lazy val pruningShare: Double =
-    context.options.findOptionOrDefault(optRoundoffPruningShare).max(0.0).min(1.0)
-
-  /** Minimum time that can be allowed to a query */
-  private val minQueryTimeout = 0.001
-
-  /** Set once the selected solver turns out not to reason about floating-point values, after
-    * which nothing is asked of it again.
-    *
-    * Only ever touched while `decompositions` is being computed, which one thread does under
-    * the lock of that lazy value, so no guard of its own is needed.
-    */
-  private var solverRefused = false
-
-  /** Whether a question has been left unanswered, which is worth saying once. */
-  private var solverUnsettled = false
-
-  /** Runs `block` with an oracle backed by one solver, which lives exactly as long as the
-    * enumeration it prunes.
-    *
-    * Not every solver reads floating point: the native Z3 interface has none of the theory,
-    * and `--solvers` names it by default. Such a solver keeps what it could not encode to
-    * itself until the first `check`, and throws on every `check` after that, so the run stops
-    * asking rather than trying again. One that reads the theory but cannot settle a question
-    * answers `Unknown`, which keeps the branch and is worth saying once rather than giving up
-    * on the rest.
-    */
-  private def withOracle[A](fd: FunDef)(block: BranchOracle => A): A =
-    if (!prune || solverRefused) block(BranchOracle.open)
-    else {
-      val factory = getFactory(options + optCheckModels(false) + optSilentErrors(true))
-      var started: Option[factory.S] = None
-
-      // What the questions will be about, told before the first of them is asked. These are the
-      // values the function's fields became rather than the objects holding them, so the solver
-      // is never handed a datatype: the one this analysis recommends has none.
-      var values: Seq[ValDef] = fd.params
-      var assumptions: Expr = fd.precondition.map(Preprocessor.stripAnnotations)
-                                .getOrElse(BooleanLiteral(true))
-
-      // Cut once the count is known, which is before the first question is asked. A function
-      // that turns out to ask none never builds it and never walks its body to count them.
-      var cake: Option[Cake] = None
-
-      // What the questions came to, said once the walk is over: a run that prunes nothing is
-      // worth telling apart from one that had no time to try.
-      var asked, refuted, unanswered, skipped = 0
-      var spent = 0L
-
-      // What `--timeout` asked for, where it was asked for at all. A question is never given
-      // longer than that, since a budget of its own is no reason to overrun the one the run
-      // was given.
-      var ambient: Option[Duration] = None
-
-      // Built by the first question rather than up front, since a function whose body has no
-      // conditional in it asks none at all, and most of them do not.
-      def solver: factory.S = started match {
-        case Some(ready) => ready
-        case None =>
-          val fresh = phases.pruning.setup.run {
-            val s = factory.getNewSolver()
-            ambient = s.optTimeout.map(_.millis)
-            values.foreach(s.declare)
-            s.assertCnstr(assumptions)
-            s
-          }
-          started = Some(fresh)
-          fresh
+    /** Reads every roundoff obligation, then hands what all of them found to the fuzzer. */
+    def readAll(vcs: Seq[VC]): Unit = {
+      val asked = vcs.flatMap { vc =>
+        vc.kind match {
+          case VCKind.RoundoffError(_, field) => Some(vc.fid -> field)
+          case _ => None
+        }
       }
 
-      try {
-        block(new BranchOracle {
-          override def knowing(known: Seq[ValDef], taken: Expr): Unit = {
-            values = known
-            assumptions = taken
-          }
+      if (asked.nonEmpty) {
+        // An interrupted run answers with what it has, since the obligations it has yet to
+        // read are not going to be answered either.
+        asked.foreach { case (fid, field) =>
+          if (!interruptManager.isInterrupted) reading(fid, field)
+        }
 
-          override def expecting(questions: => Int): Unit =
-            cake = Some(new Cake(budget * pruningShare, questions))
 
-          def assuming[B](condition: Expr)(block: => B): Option[B] = {
-            // What this question may take: the share left over the questions left. An
-            // over-estimate of how many are left only makes the shares smaller, so the phase
-            // keeps to its part of the budget either way.
-            val allowance = cake.fold(budget * pruningShare)(_.slice())
+        Settings.witnessFile.foreach { file =>
+          scala.util.Try(phases.witnesses.run(Fuzzing.writeFuzzerInputs(file))).failed.foreach(e =>
+            reporter.warning(s"Could not write the divergences to $file: ${e.getMessage}"))
+        }
 
-            if (solverRefused || allowance < minQueryTimeout) { skipped += 1; Some(block) }
-            else {
-              cake.foreach(_.taken())
-              asked += 1
-              val questioned = solver
-              questioned.setTimeout(ambient.fold(allowance.seconds)(_.min(allowance.seconds)))
-              questioned.push()
-              try {
-                questioned.assertCnstr(condition)
-                // A question left open has to keep the branch: only a refutation says that
-                // no input reaches it.
-                val (took, answer) = phases.pruning.questions.runAndGetTime(questioned.check(Simple))
-                spent += took
-                told(fd, condition, answer)
-                answer match {
-                  case scala.util.Success(Unsat) => refuted += 1; None
-                  case scala.util.Success(Unknown) =>
-                    unanswered += 1; unsettled(fd); Some(block)
-                  case scala.util.Success(_) => Some(block)
-                  case scala.util.Failure(e) =>
-                    unanswered += 1; refused(fd, e); Some(block)
-                }
-              } finally questioned.pop()
+        Fuzzing.run()
+      }
+    }
+
+    /** Answers one obligation from its reading, and from what the fuzzer made of the function. */
+    def answer(vc: VC, limit: Option[BigDecimal], field: Option[String]): VCResult = {
+      val fd = getFunction(vc.fid)
+      val named = label(vc.fid, field)
+      val (time, found) = reading(vc.fid, field)
+      val lowerBound = Fuzzing.lowerBound(fd)
+
+      val (status, inferred, lower) = found match {
+        case scala.util.Success(Right(error)) =>
+          reporter.info(fd.getPos, s"Inferred a roundoff error of $error for $named")
+          lowerBound.foreach(compare(fd, error, _))
+          (verdict(fd, named, error, limit), Some(error), lowerBound)
+
+        case scala.util.Success(Left(why)) =>
+          reporter.warning(fd.getPos, s"Cannot bound the roundoff error of $named: $why")
+          (VCStatus.Unsupported, None, lowerBound)
+
+        case scala.util.Failure(thrown) =>
+          reporter.warning(fd.getPos, s"Roundoff analysis of $named failed: ${thrown.getMessage}")
+          reporter.debug(thrown.getStackTrace.take(12).mkString("\n"))(
+            using DebugSectionVerification)
+          (VCStatus.Unsupported, None, None)
+      }
+
+      // Both bounds are shown where there are both, on the line the summary gives to solvers.
+      val figures =
+        inferred.map(e => s"${analyzer.name}: ${round(e, java.math.RoundingMode.CEILING)}").toSeq ++
+          lower.map(l => s"${fuzzer.name}: ${round(l, java.math.RoundingMode.FLOOR)}")
+
+      val solver = if (figures.isEmpty) analyzer.name else figures.mkString(", ")
+      VCResult(status, Some(solver), Some(time), None)
+    }
+
+    private val readings = scala.collection.mutable.Map
+      .empty[(Identifier, Option[String]), (Long, scala.util.Try[Either[String, BigDecimal]])]
+
+    /** What one obligation came to, and how long that took, worked out once. */
+    private def reading(fid: Identifier, field: Option[String])
+      : (Long, scala.util.Try[Either[String, BigDecimal]]) =
+      synchronized {
+        readings.getOrElseUpdate((fid, field),
+          timers.verification.runAndGetTime(bound.of(fid, field)))
+      }
+
+    private def verdict(fd: FunDef, named: String, error: BigDecimal,
+                        limit: Option[BigDecimal]): VCStatus =
+      limit match {
+        case None => VCStatus.Valid
+        case Some(most) if error <= most => VCStatus.Valid
+        case Some(most) =>
+          reporter.warning(fd.getPos,
+            s"Roundoff error for $named is $error, which exceeds the bound $most")
+          VCStatus.Invalid(VCStatus.Unsatisfiable)
+      }
+
+    /** Says where the true worst case lies, and warns if the fuzzer beat the inferred bound. */
+    private def compare(fd: FunDef, inferred: BigDecimal, observed: BigDecimal): Unit = {
+      reporter.info(fd.getPos,
+        s"Fuzzing ${fd.id.asString} made an error of $observed, so the true worst case " +
+        s"lies in [$observed, $inferred]")
+
+      if (observed > inferred)
+        reporter.warning(fd.getPos,
+          s"The fuzzer made an error of $observed on ${fd.id.asString}, which is above the " +
+          s"inferred bound $inferred: the bound is unsound, or the program the fuzzer ran " +
+          "is not the one that was analyzed")
+    }
+
+    private def round(e: BigDecimal, towards: java.math.RoundingMode): String =
+      e.round(new java.math.MathContext(4, towards)).toString
+  }
+  /** The bound for one obligation: the worst rounding of a leaf, plus the worst divergence. */
+  private object bound {
+
+    /** The error bound for one number of a function's result, or why none was established. */
+    def of(fid: Identifier, field: Option[String]): Either[String, BigDecimal] =
+      decompositions.of(fid, field).flatMap { parts =>
+        val name = label(fid, field)
+
+        for {
+          // A guard can only be misread where its two sides are within their combined error.
+          guards <- traverse(parts.guardOperandErrors) { case (lhs, rhs) =>
+                      for { l <- errorFrom(lhs); r <- errorFrom(rhs) } yield l + r
+                    }
+          rounding <- traverse(parts.reachableLeaves)(errorFrom)
+          divergences <- search(fid, name, parts, guards)
+        } yield {
+          val worstDivergence = (BigDecimal(0) +: divergences).max
+          val worstRounding = rounding.max
+
+          describe(name, parts, divergences, worstDivergence, worstRounding)
+          // Added under a rounding of the analysis's own choosing: the default one shortens a
+          // long sum towards zero as readily as away from it, and a bound shortened towards
+          // zero is no longer a bound.
+          new BigDecimal(worstDivergence.bigDecimal, reportedPrecision) + worstRounding
+        }
+      }
+
+    /** What Ibex made of every region where the two computations may take different paths. */
+    private def search(fid: Identifier, name: String, parts: ErrorDecomposition,
+                       guards: Seq[BigDecimal]): Either[String, Seq[BigDecimal]] = {
+      // What is left of the function's budget, cut equally among the numbers in its result:
+      // they are separate obligations, and none is told what the others will need.
+      val remaining = decompositions.budgetLeft(fid) / decompositions.fieldCount(fid).max(1)
+
+      ibex.within(remaining, parts.discontinuities.queries) {
+        parts.discontinuities match {
+          case DiscontinuityPlan.Pairwise(problems) =>
+            traverse(problems.zipWithIndex) { case (problem, path) =>
+              ibex.discontinuityBound(problem, parts.guardDifferences, guards, Site(name, path))
             }
-          }
-        })
-      } catch {
-        case e: inox.Unsupported => refused(fd, e); block(BranchOracle.open)
-      } finally {
-        if (asked + skipped > 0) {
-          val share = budget * pruningShare
+          case DiscontinuityPlan.Merged(regions) =>
+            traverse(regions) { region =>
+              ibex.mergedBound(region, parts.guardDifferences, guards, Site(name, region.guard))
+            }
+          case DiscontinuityPlan.ViaReference(regions) =>
+            traverse(regions) { region =>
+              ibex.referenceBound(region, parts.guardDifferences, guards, Site(name, region.guard))
+            }
+        }
+      }
+    }
+
+    /** The error of one leaf, or of one side of one guard. */
+    private def errorFrom(source: RoundingError): Either[String, BigDecimal] = source match {
+      case RoundingError.Exact => Right(BigDecimal(0))
+      // Only the leaves a run reaches are ever asked about, so this says the decomposition and
+      // the reading of it have come apart rather than that the error is nothing.
+      case RoundingError.Unreachable =>
+        Left("the error of a leaf no run reaches was asked for")
+      case RoundingError.Computed(error) => Right(error)
+      case RoundingError.FromAnalyzer(query) =>
+        measured
+          .getOrElse(query.name, Left(s"${analyzer.name} reported no result for '${query.name}'"))
+          .map(_.absError)
+    }
+
+    /** Every query of every annotated function, in one batch: the analyzer starts up once. */
+    private lazy val measured: Map[String, Either[String, RoundingResult]] = {
+      val queries = decompositions.byFunction.values
+        .collect { case Right(fields) => fields.flatMap { case (_, parts) => parts.queries } }
+        .flatten.toSeq
+        .distinctBy(_.name)
+
+      if (queries.isEmpty) Map.empty else phases.rounding.run(analyzer.analyze(queries))
+    }
+
+    /** The three lines a reading leaves on the debug sections, named by field as well. */
+    private def describe(name: String, parts: ErrorDecomposition, divergences: Seq[BigDecimal],
+                         worstDivergence: BigDecimal, worstRounding: BigDecimal): Unit = {
+      val shape = parts.shape
+      val found = divergences.count(_ > 0)
+
+      reporter.debug(
+        s"Roundoff shape of $name: ${counted(shape.guards, "guard")} over " +
+        s"${counted(shape.paths, "path")}, nested ${shape.depth} deep, " +
+        s"${counted(shape.distinct, "leaf", "leaves")} computing something different, " +
+        s"${counted(parts.unreachableCount, "path")} that no input reaches"
+      )(using DebugSectionRoundoff)
+
+      reporter.debug(
+        s"Roundoff plan of $name (${Settings.mode.toString.toLowerCase}): " +
+        s"${counted(parts.discontinuities.size, "region")} holding " +
+        s"${counted(parts.discontinuities.queries, "comparison")}, " +
+        s"$found of which ${if (found == 1) "holds" else "hold"} a divergence; " +
+        s"${counted(parts.queries.map(_.name).distinct.size, "analyzer query", "analyzer queries")}"
+      )(using DebugSectionRoundoff)
+
+      reporter.debug(
+        s"Roundoff for $name (${Settings.mode.toString.toLowerCase}): " +
+        s"worst discontinuity $worstDivergence, worst rounding $worstRounding"
+      )(using DebugSectionVerification)
+    }
+  }
+  /** What the analysis made of each annotated function, and what reading it cost. */
+  private object decompositions {
+
+    /** One decomposition per number in a function's result, since several numbers are several
+      * errors: a tuple or a case class gives one per number inside it, over the same guards.
+      */
+    lazy val byFunction: Map[Identifier, Either[String, Seq[(ResultPath, ErrorDecomposition)]]] =
+      read.map { case (id, _, outcome) => id -> outcome }.toMap
+
+    /** One field's decomposition, by the label the obligation was raised under. */
+    def of(fid: Identifier, field: Option[String]): Either[String, ErrorDecomposition] =
+      byFunction.getOrElse(fid, Left("this function was not analyzed")).flatMap { fields =>
+        fields.find { case (path, _) => field.forall(_ == path.label) }
+          .map { case (_, parts) => parts }
+          .toRight(s"nothing in the result of this function is called '${field.getOrElse("")}'")
+      }
+
+    /** The first decomposition of a function, which is all of it where the result is one number. */
+    def first(fid: Identifier): Either[String, ErrorDecomposition] = of(fid, None)
+
+    /** How many numbers a function's result holds, as far as it was read. */
+    def fieldCount(fid: Identifier): Int =
+      byFunction.get(fid).flatMap(_.toOption).map(_.size).getOrElse(1)
+
+    /** What each function calls its inputs, in the order it declares them. */
+    lazy val parameterNames: Map[String, Seq[String]] =
+      annotated.map { fd =>
+        fd.id.name -> first(fd.id).toOption
+          .map(_.flattening.parameters).getOrElse(fd.params).map(_.id.name)
+      }.toMap
+
+    /** What is left of a function's budget once its reading is taken off. */
+    def budgetLeft(fid: Identifier): Double = {
+      val spent = timeSpent.getOrElse(fid, 0L) / 1000.0
+      val left = Settings.budget - spent
+
+      if (left <= 0)
+        reporter.warning(getFunction(fid).getPos,
+          s"Reading ${getFunction(fid).id.asString} took ${spent}s of a ${Settings.budget}s " +
+          "budget, so its divergences are bounded on whatever is left of it; " +
+          "--roundoff-timeout raises it")
+
+      left
+    }
+
+    /** Every annotated function is read at once, since the analyzer is asked in one batch. */
+    private lazy val read
+      : Seq[(Identifier, Long, Either[String, Seq[(ResultPath, ErrorDecomposition)]])] =
+      annotated.map { fd =>
+        Settings.announced
+        val start = System.nanoTime()
+        val outcome = oracle.around(fd) { branches =>
+          ErrorDecomposition.of(fd, Settings.exactInputs, Settings.mode, branches, phases,
+                                Settings.normalise, Settings.pathRanges)(using program.symbols)
+        }
+        (fd.id, (System.nanoTime() - start) / 1000000, outcome)
+      }
+
+    /** How long reading each function took. The analyzer is not counted: one batch answers
+      * every function and cannot honestly be charged to any one of them.
+      */
+    private lazy val timeSpent: Map[Identifier, Long] =
+      read.map { case (id, spent, _) => id -> spent }.toMap
+  }
+  /** The solver questions that set aside the paths no input takes. */
+  private object oracle {
+
+    /** Runs `block` with an oracle backed by one solver, which lives as long as the
+      * enumeration it prunes.
+      *
+      * Not every solver reads floating point: one that does not keeps what it could not encode
+      * to itself until the first `check` and throws on every one after that, so the run stops
+      * asking rather than trying again.
+      */
+    def around[A](fd: FunDef)(block: BranchOracle => A): A =
+      if (!Settings.prune || refusedFloats) block(BranchOracle.open)
+      else {
+        val factory = getFactory(options + optCheckModels(false) + optSilentErrors(true))
+        var started: Option[factory.S] = None
+
+        // What the questions are about: the values the function's fields became rather than
+        // the objects holding them, so the solver is never handed a datatype.
+        var values: Seq[ValDef] = fd.params
+        var assumptions: Expr = fd.precondition.map(Preprocessor.stripAnnotations)
+                                  .getOrElse(BooleanLiteral(true))
+
+        // Cut once the count is known, which is before the first question is asked.
+        var cake: Option[Cake] = None
+
+        var asked, refuted, unanswered, skipped = 0
+        var spent = 0L
+
+        // Said once the walk is over: a run that prunes nothing is worth telling apart from
+        // one that had no time to try.
+        def summarise(): Unit = {
+          val share = Settings.budget * Settings.pruningShare
           val used = ((share - cake.fold(0.0)(_.left)) * 1000).toInt.max(0)
           reporter.debug(
             s"Roundoff pruning of ${fd.id.asString}: $asked of " +
@@ -306,359 +366,260 @@ trait RoundoffChecker extends VerificationChecker {
             "rest on building the solver and stating the guards"
           )(using DebugSectionRoundoff)
         }
-        started.foreach(factory.reclaim)
-      }
-    }
 
-  /** Says what became of one question, so that a run can be watched cutting a subtree rather
-    * than refusing its leaves one at a time.
-    */
-  private def told(fd: FunDef, condition: Expr,
-                   answer: scala.util.Try[SolverResponses.SimpleResponse]): Unit = {
-    val outcome = answer match {
-      case scala.util.Success(Unsat) => "no input reaches it"
-      case scala.util.Success(response) => s"kept ($response)"
-      case scala.util.Failure(e) => s"kept, unanswered: ${e.getMessage}"
-    }
-    reporter.debug(s"Reachability of ${fd.id.name} under ${condition.asString}: $outcome")(
-      using inox.solvers.DebugSectionSolver)
-  }
+        // What `--timeout` asked for: a budget of its own is no reason for a question to
+        // overrun the one the run was given.
+        var ambient: Option[Duration] = None
 
-  /** A question that answers nothing is still followed by the rest of them, since one hard
-    * branch says little about the next, but a run where that is happening throughout is worth
-    * telling apart from one where every branch was settled.
-    */
-  private def unsettled(fd: FunDef): Unit = {
-    if (!solverUnsettled)
-      reporter.warning(fd.getPos,
-        "A question about which branches are taken was left unanswered, so some leaf no input " +
-        "reaches may still count towards the bound; the questions of one function share " +
-        s"${pruningShare} of --roundoff-timeout, which raising either gives them more of, and a " +
-        "solver reading floating point, such as --solvers=smt-bitwuzla, settles more of them")
-    solverUnsettled = true
-  }
-
-  private def refused(fd: FunDef, e: Throwable): Unit = {
-    if (!solverRefused)
-      reporter.warning(fd.getPos,
-        s"The selected solver cannot answer about floating-point values (${e.getMessage}), so " +
-        "no unreachable path was set aside and every leaf counts towards the bound; " +
-        "--solvers=smt-bitwuzla answers these")
-    solverRefused = true
-  }
-
-  /** What each function calls its inputs, in the order it declares them. */
-  private lazy val parametersOf: Map[String, Seq[String]] =
-    annotated.map { fd =>
-      fd.id.name -> firstOf(fd.id).toOption
-        .map(_.flattening.parameters).getOrElse(fd.params).map(_.id.name)
-    }.toMap
-
-  /** The functions handed to the fuzzer, each with the program written for it.
-    *
-    * A witness names the function it belongs to and nothing more, so two annotated
-    * functions of the same name cannot be told apart, and only the first is written.
-    */
-  private lazy val subjects: Seq[(FuzzSubject, String)] =
-    annotated.filter(_.flags.contains(Fuzz)).foldLeft(
-      (Set.empty[String], Seq.empty[(FuzzSubject, String)])) {
-      case ((taken, built), fd) =>
-        val name = fd.id.name
-        val subject =
-          if (taken(name))
-            Left(s"another annotated function is called '$name', and a witness names only " +
-                 "the function it belongs to, so the two cannot be told apart")
-          else
-            for {
-              _ <- Either.cond(!ResultPath.isCompound(fd.returnType), (),
-                     "the fuzzer returns one double, and this function's result holds several " +
-                     "numbers; the analysis answers about each of them but the fuzzer is not " +
-                     "asked about any")
-              parts <- firstOf(fd.id)
-              values = parts.flattening.parameters
-              domain <- traverse(values)(p => parts.spec.ranges.get(p.id).toRight(
-                          s"no range in the precondition for '${p.id.name}'"))
-              source <- FuzzProgramEmitter.emit(fd, name, parts.spec, parts.body, values,
-                          FPCoreEmitter.assumptions(fd, parts.flattening))(using program.symbols)
-            } yield (FuzzSubject(name, values.map(_.id.name), domain), source)
-
-        subject match {
-          case Right(one) => (taken + name, built :+ one)
-          case Left(why) =>
-            reporter.warning(fd.getPos, s"No fuzzer program for ${fd.id.asString}: $why")
-            (taken, built)
+        // Built by the first question, since a function whose body has no conditional in it
+        // asks none at all, and most of them do not.
+        def solver: factory.S = started match {
+          case Some(ready) => ready
+          case None =>
+            val fresh = phases.pruning.setup.run {
+              val s = factory.getNewSolver()
+              ambient = s.optTimeout.map(_.millis)
+              values.foreach(s.declare)
+              s.assertCnstr(assumptions)
+              s
+            }
+            started = Some(fresh)
+            fresh
         }
-    }._2
 
-  /** Every query of every annotated function goes out in one batch, because the analyzer
-    * pays its startup cost once per run.
-    */
-  /** Every query of every annotated function goes out in one batch, because the analyzer
-    * pays its startup cost once per run.
-    *
-    * That one batch holds the branches and the conditions together, and the analyzer's own
-    * timing cannot separate them either: its results carry a figure for the whole run, repeated
-    * against every function in it. So `rounding` is one phase covering both.
-    */
-  private lazy val measured: Map[String, Either[String, RoundingResult]] = {
-    val queries = decompositions.values
-      .collect { case Right(fields) => fields.flatMap { case (_, parts) => parts.queries } }
-      .flatten.toSeq
-      .distinctBy(_.name)
+        try {
+          block(new BranchOracle {
+            override def knowing(known: Seq[ValDef], taken: Expr): Unit = {
+              values = known
+              assumptions = taken
+            }
 
-    if (queries.isEmpty) Map.empty else phases.rounding.run(analyzer.analyze(queries))
-  }
+            override def expecting(questions: => Int): Unit =
+              cake = Some(new Cake(Settings.budget * Settings.pruningShare, questions))
 
-  /** What was made of one obligation, and how long that took.
-    *
-    * Every obligation is read before any of them is answered, so that the fuzzer can be
-    * handed the regions all of them found; this is where the reading waits until the
-    * obligation's own turn comes. One that was not read then, because the run was
-    * interrupted, is read here instead.
-    */
-  private val readings = scala.collection.mutable.Map
-    .empty[(Identifier, Option[String]), (Long, scala.util.Try[Either[String, BigDecimal]])]
+            def assuming[B](condition: Expr)(block: => B): Option[B] = {
+              // The share left over the questions left. Over-estimating how many are left only
+              // makes the shares smaller, so the phase keeps to its part of the budget either way.
+              val allowance = cake.fold(Settings.budget * Settings.pruningShare)(_.slice())
 
-  private def reading(fid: Identifier, field: Option[String])
-    : (Long, scala.util.Try[Either[String, BigDecimal]]) =
-    synchronized {
-      readings.getOrElseUpdate((fid, field),
-        timers.verification.runAndGetTime(errorOf(fid, field)))
-    }
-
-  private def checkRoundoff(vc: VC, bound: Option[BigDecimal],
-                           field: Option[String]): VCResult = {
-    val fd = getFunction(vc.fid)
-    val named = label(vc.fid, field)
-
-    val (time, found) = reading(vc.fid, field)
-    // The fuzzer has already searched the regions that every reading established, so this
-    // only reads what it made of this function.
-    val observed = fuzz(fd)
-
-    val (status, error, lower) = found match {
-      case scala.util.Success(Right(error)) =>
-        reporter.info(fd.getPos, s"Inferred a roundoff error of $error for $named")
-        observed.foreach(reported(fd, error, _))
-        (verdict(fd, named, error, bound), Some(error), observed)
-
-      case scala.util.Success(Left(why)) =>
-        reporter.warning(fd.getPos, s"Cannot bound the roundoff error of $named: $why")
-        (VCStatus.Unsupported, None, observed)
-
-      case scala.util.Failure(thrown) =>
-        reporter.warning(fd.getPos, s"Roundoff analysis of $named failed: ${thrown.getMessage}")
-        reporter.debug(thrown.getStackTrace.take(12).mkString("\n"))(
-          using DebugSectionVerification)
-        (VCStatus.Unsupported, None, None)
-    }
-
-    def round(e: BigDecimal, towards: java.math.RoundingMode): String =
-      e.round(new java.math.MathContext(4, towards)).toString
-
-    // Displays the error next to the solvers
-    val figures =
-      error.map(e => s"${analyzer.name}: ${round(e, java.math.RoundingMode.CEILING)}").toSeq ++
-        lower.map(l => s"${fuzzer.name}: ${round(l, java.math.RoundingMode.FLOOR)}")
-
-    val solver = if (figures.isEmpty) analyzer.name else figures.mkString(", ")
-    VCResult(status, Some(solver), Some(time), None)
-  }
-
-  /** Says what the fuzzer made of a function, and whether the two bounds agree.
-    *
-    * A fuzzed error above the inferred one is not a loose bound but a broken one: either
-    * the bound is unsound, or the program handed to the fuzzer is not the one analyzed.
-    */
-  private def reported(fd: FunDef, inferred: BigDecimal, observed: BigDecimal): Unit = {
-    reporter.info(fd.getPos,
-      s"Fuzzing ${fd.id.asString} made an error of $observed, so the true worst case " +
-      s"lies in [$observed, $inferred]")
-
-    if (observed > inferred)
-      reporter.warning(fd.getPos,
-        s"The fuzzer made an error of $observed on ${fd.id.asString}, which is above the " +
-        s"inferred bound $inferred: the bound is unsound, or the program the fuzzer ran " +
-        "is not the one that was analyzed")
-  }
-
-  private def verdict(fd: FunDef, named: String, error: BigDecimal,
-                      bound: Option[BigDecimal]): VCStatus =
-    bound match {
-      case None => VCStatus.Valid
-      case Some(limit) if error <= limit => VCStatus.Valid
-      case Some(limit) =>
-        reporter.warning(fd.getPos,
-          s"Roundoff error for $named is $error, which exceeds the bound $limit")
-        VCStatus.Invalid(VCStatus.Unsatisfiable)
-    }
-
-  /** The error bound for one number of one function's result, or why none was established. */
-  private def errorOf(fid: Identifier, field: Option[String]): Either[String, BigDecimal] =
-    decompositionOf(fid, field).flatMap { parts =>
-      for {
-        // A guard can only be misread where its two sides are within their combined error.
-        guardErrors <- traverse(parts.guardOperandErrors) { case (lhs, rhs) =>
-                         for { l <- errorFrom(lhs); r <- errorFrom(rhs) } yield l + r
-                       }
-        rounding <- traverse(parts.reachableLeaves)(errorFrom)
-        name = label(fid, field)
-        // What is left of the function's budget, cut equally among the numbers in its result:
-        // they are separate obligations, and none of them is told what the others will need,
-        // so each is given the same share.
-        remaining = remainingFor(fid) / fieldsOf(fid).max(1)
-        bounds <- ibex.within(remaining, parts.discontinuities.queries) {
-                    parts.discontinuities match {
-                      case DiscontinuityPlan.Pairwise(problems) =>
-                        traverse(problems.zipWithIndex) { case (problem, path) =>
-                          ibex.discontinuityBound(problem, parts.guardDifferences, guardErrors,
-                                                  Site(name, path))
-                        }
-                      case DiscontinuityPlan.Merged(regions) =>
-                        traverse(regions) { region =>
-                          ibex.mergedBound(region, parts.guardDifferences, guardErrors,
-                                           Site(name, region.guard))
-                        }
-                      case DiscontinuityPlan.ViaReference(regions) =>
-                        traverse(regions) { region =>
-                          ibex.referenceBound(region, parts.guardDifferences, guardErrors,
-                                              Site(name, region.guard))
-                        }
-                    }
+              if (refusedFloats || allowance < minQueryTimeout) { skipped += 1; Some(block) }
+              else {
+                cake.foreach(_.taken())
+                asked += 1
+                val questioned = solver
+                questioned.setTimeout(ambient.fold(allowance.seconds)(_.min(allowance.seconds)))
+                questioned.push()
+                try {
+                  questioned.assertCnstr(condition)
+                  val (took, answer) =
+                    phases.pruning.questions.runAndGetTime(questioned.check(Simple))
+                  spent += took
+                  trace(fd, condition, answer)
+                  // A question left open has to keep the branch: only a refutation says that
+                  // no input reaches it.
+                  answer match {
+                    case scala.util.Success(Unsat) => refuted += 1; None
+                    case scala.util.Success(Unknown) =>
+                      unanswered += 1; warnUnsettled(fd); Some(block)
+                    case scala.util.Success(_) => Some(block)
+                    case scala.util.Failure(e) =>
+                      unanswered += 1; warnRefused(fd, e); Some(block)
                   }
-      } yield {
-        val worstDiscontinuity = (BigDecimal(0) +: bounds).max
-        val worstRounding = rounding.max
-        // Named by the field as well, since a result of several numbers gives one of these
-        // lines per number and they otherwise read alike.
-        val shown = label(fid, field)
-        val shape = parts.shape
-
-        reporter.debug(
-          s"Roundoff shape of $shown: ${counted(shape.guards, "guard")} over " +
-          s"${counted(shape.paths, "path")}, nested ${shape.depth} deep, " +
-          s"${counted(shape.distinct, "leaf", "leaves")} computing something different, " +
-          s"${counted(parts.unreachableCount, "path")} that no input reaches"
-        )(using DebugSectionRoundoff)
-
-        reporter.debug(
-          s"Roundoff plan of $shown (${mode.toString.toLowerCase}): " +
-          s"${counted(parts.discontinuities.size, "region")} holding " +
-          s"${counted(parts.discontinuities.queries, "comparison")}, " +
-          s"${bounds.count(_ > 0)} of which ${if (bounds.count(_ > 0) == 1) "holds" else "hold"} " +
-          "a divergence; " +
-          s"${counted(parts.queries.map(_.name).distinct.size, "analyzer query", "analyzer queries")}"
-        )(using DebugSectionRoundoff)
-
-        // The two halves of the bound, on the section that carries a line per obligation.
-        // What they were worked out from is on `roundoff`, in the three lines above.
-        reporter.debug(
-          s"Roundoff for $shown (${mode.toString.toLowerCase}): " +
-          s"worst discontinuity $worstDiscontinuity, worst rounding $worstRounding"
-        )(using DebugSectionVerification)
-        // Added under a rounding of the analysis's own choosing, because the default one
-        // shortens a long sum towards zero as readily as away from it, and a bound that
-        // has been shortened towards zero is no longer a bound.
-        new BigDecimal(worstDiscontinuity.bigDecimal, reportedPrecision) + worstRounding
+                } finally questioned.pop()
+              }
+            }
+          })
+        } catch {
+          case e: inox.Unsupported => warnRefused(fd, e); block(BranchOracle.open)
+        } finally {
+          if (asked + skipped > 0) summarise()
+          started.foreach(factory.reclaim)
+        }
       }
+
+    /** The shortest time a question is worth asking for. */
+    private val minQueryTimeout = 0.001
+
+    /** Set once the solver turns out not to read floating point, after which it is not asked
+      * again. Touched only while the decompositions are read, which one thread does under the
+      * lock of that lazy value, so neither flag needs a guard of its own.
+      */
+    private var refusedFloats = false
+    private var sawUnsettled = false
+
+    /** Says what became of one question, so a run can be watched cutting whole subtrees. */
+    private def trace(fd: FunDef, condition: Expr,
+                      answer: scala.util.Try[SolverResponses.SimpleResponse]): Unit = {
+      val outcome = answer match {
+        case scala.util.Success(Unsat) => "no input reaches it"
+        case scala.util.Success(response) => s"kept ($response)"
+        case scala.util.Failure(e) => s"kept, unanswered: ${e.getMessage}"
+      }
+      reporter.debug(s"Reachability of ${fd.id.name} under ${condition.asString}: $outcome")(
+        using inox.solvers.DebugSectionSolver)
     }
 
-  /** What is left of a function's budget once the phases before the queries are taken off.
-    *
-    * The reachability questions are one of those phases and are held to their own share of the
-    * budget, so what they leave behind is here rather than lost: a function whose branches
-    * settle at once hands the queries more than the share the split nominally gives them.
-    */
-  private def remainingFor(fid: Identifier): Double = {
-    val spent = spentOn.getOrElse(fid, 0L) / 1000.0
-    val left = budget - spent
+    /** Warned about once: one hard branch says little, but a run that settles none prunes
+      * nothing, and that is worth telling apart from a run that pruned nothing to find.
+      */
+    private def warnUnsettled(fd: FunDef): Unit = {
+      if (!sawUnsettled)
+        reporter.warning(fd.getPos,
+          "A question about which branches are taken was left unanswered, so some leaf no input " +
+          "reaches may still count towards the bound; the questions of one function share " +
+          s"${Settings.pruningShare} of --roundoff-timeout, which raising either gives them more " +
+          "of, and a solver reading floating point, such as --solvers=smt-bitwuzla, settles " +
+          "more of them")
+      sawUnsettled = true
+    }
 
-    if (left <= 0)
-      reporter.warning(getFunction(fid).getPos,
-        s"Reading ${getFunction(fid).id.asString} took ${spent}s of a ${budget}s budget, so its " +
-        "divergences are bounded on whatever is left of it; --roundoff-timeout raises it")
+    private def warnRefused(fd: FunDef, e: Throwable): Unit = {
+      if (!refusedFloats)
+        reporter.warning(fd.getPos,
+          s"The selected solver cannot answer about floating-point values (${e.getMessage}), so " +
+          "no unreachable path was set aside and every leaf counts towards the bound; " +
+          "--solvers=smt-bitwuzla answers these")
+      refusedFloats = true
+    }
+  }
+  private object Fuzzing {
 
-    left
+    /** The `@fuzz` functions, each with the program written for it. A witness names only the
+      * function it belongs to, so of two functions of the same name only the first is written.
+      */
+    private lazy val subjects: Seq[(FuzzSubject, String)] =
+      annotated.filter(_.flags.contains(Fuzz)).foldLeft(
+        (Set.empty[String], Seq.empty[(FuzzSubject, String)])) {
+        case ((taken, built), fd) =>
+          val name = fd.id.name
+          val subject =
+            if (taken(name))
+              Left(s"another annotated function is called '$name', and a witness names only " +
+                   "the function it belongs to, so the two cannot be told apart")
+            else
+              for {
+                _ <- Either.cond(!ResultPath.isCompound(fd.returnType), (),
+                       "the fuzzer returns one double, and this function's result holds several " +
+                       "numbers; the analysis answers about each of them but the fuzzer is not " +
+                       "asked about any")
+                parts <- decompositions.first(fd.id)
+                values = parts.flattening.parameters
+                domain <- traverse(values)(p => parts.spec.ranges.get(p.id).toRight(
+                            s"no range in the precondition for '${p.id.name}'"))
+                source <- FuzzProgramEmitter.emit(fd, name, parts.spec, parts.body, values,
+                            FPCoreEmitter.assumptions(fd, parts.flattening))(using program.symbols)
+              } yield (FuzzSubject(name, values.map(_.id.name), domain), source)
+
+          subject match {
+            case Right(one) => (taken + name, built :+ one)
+            case Left(why) =>
+              reporter.warning(fd.getPos, s"No fuzzer program for ${fd.id.asString}: $why")
+              (taken, built)
+          }
+      }._2
+
+    /** Runs the fuzzer over all functions. */
+    def run(): Unit = { val _ = fuzzerResult }
+
+    /** The lower bound the fuzzer returned for a given function */
+    def lowerBound(fd: FunDef): Option[BigDecimal] =
+      if (!fuzzer.enabled || subjects.isEmpty) None
+      else
+        fuzzerResult.flatMap(_.get(fd.id.name).toRight("the fuzzer reported nothing for it")) match {
+          case Right(error) => Some(error)
+          case Left(why) =>
+            reporter.warning(fd.getPos, s"No fuzzed error for ${fd.id.asString}: $why")
+            None
+        }
+
+    def writeFuzzerInputs(file: java.io.File): Unit = {
+      val parameters = (name: String) => decompositions.parameterNames.getOrElse(name, Seq.empty)
+
+      stainless.utils.JsonUtils.writeFile(file, Witness.report(ibex.witnesses, parameters))
+      if (subjects.nonEmpty) writeSubjects(file)
+    }
+
+    private lazy val fuzzerResult: Either[String, Map[String, BigDecimal]] =
+      if (!fuzzer.enabled || subjects.isEmpty) Left("the fuzzer was not run")
+      else
+        scala.util.Try(
+          phases.fuzzing.run(fuzzer.run(writeSubjects(Settings.witnessFile.getOrElse(scratch)))))
+          .fold(e => Left(s"the fuzzer could not be run: ${e.getMessage}"), identity)
+
+    /** Writes the program and the configuration. */
+    private def writeSubjects(base: java.io.File): java.io.File = {
+      val found = ibex.witnesses.groupBy(_.function)
+      val conf = sibling(base, "conf")
+
+      write(sibling(base, "scala"), subjects.map(_._2).mkString("\n"))
+      write(conf, FuzzConfEmitter.emit(subjects.map {
+        case (subject, _) => subject -> found.getOrElse(subject.name, Seq.empty)
+      }))
+      conf
+    }
+
+    /** Where the fuzzer's input goes when no witnesses were asked to be written out. */
+    private lazy val scratch: java.io.File = {
+      val directory = java.nio.file.Files.createTempDirectory("stainless-roundoff").toFile
+      directory.deleteOnExit()
+      new java.io.File(directory, "roundoff.json")
+    }
+
+    private def sibling(file: java.io.File, extension: String): java.io.File = {
+      val name = file.getName
+      val base = name.lastIndexOf('.') match { case -1 => name; case dot => name.take(dot) }
+      new java.io.File(file.getParentFile, s"$base.$extension")
+    }
+
+    private def write(file: java.io.File, content: String): Unit = {
+      val out = new java.io.FileWriter(file)
+      try out.write(content) finally out.close()
+    }
   }
 
-  private def errorFrom(source: RoundingError): Either[String, BigDecimal] = source match {
-    case RoundingError.Exact => Right(BigDecimal(0))
-    // Only the leaves a run reaches are ever asked about, so this says the decomposition and
-    // the reading of it have come apart rather than that the error is nothing.
-    case RoundingError.Unreachable =>
-      Left("the error of a leaf no run reaches was asked for")
-    case RoundingError.Computed(error) => Right(error)
-    case RoundingError.FromAnalyzer(query) =>
-      measured
-        .getOrElse(query.name, Left(s"${analyzer.name} reported no result for '${query.name}'"))
-        .map(_.absError)
+  private object Settings {
+
+    /** Where the regions a divergence may occur in are written out, if they were asked for. */
+    lazy val witnessFile: Option[java.io.File] =
+      Some(context.options.findOptionOrDefault(optRoundoffWitnesses))
+        .filter(_.nonEmpty)
+        .map(new java.io.File(_))
+
+    lazy val exactInputs: Boolean =
+      context.options.findOptionOrDefault(optRoundoffExactInputs)
+
+    lazy val prune: Boolean =
+      context.options.findOptionOrDefault(optRoundoffPruning)
+
+    lazy val pathRanges: Boolean =
+      context.options.findOptionOrDefault(optRoundoffPathRanges)
+
+    lazy val normalise: Boolean =
+      context.options.findOptionOrDefault(optRoundoffNormalisation)
+
+    lazy val mode: DiscontinuityMode =
+      context.options.findOptionOrDefault(optRoundoffDiscontinuity)
+
+    /** How long one function may be read and searched for, all phases together. */
+    lazy val budget: Double = context.options.findOptionOrDefault(optRoundoffTimeout)
+
+    /** What fraction of a function's budget its reachability questions may take together. */
+    lazy val pruningShare: Double =
+      context.options.findOptionOrDefault(optRoundoffPruningShare).max(0.0).min(1.0)
+
+    /** Debug information. */
+    lazy val announced: Unit = {
+      val on = (name: String, flag: Boolean) => if (flag) name else s"no $name"
+      reporter.debug(
+        s"Roundoff Settings: ${mode.toString.toLowerCase} discontinuities, " +
+        s"${budget}s per function of which ${(pruningShare * 100).toInt}% for the branch " +
+        s"questions, ${(context.options.findOptionOrDefault(optRoundoffFeasibilityShare) * 100).toInt}% " +
+        s"of a search for feasibility, " +
+        Seq(on("pruning", prune), on("normalisation", normalise), on("path ranges", pathRanges),
+            on("incumbent", context.options.findOptionOrDefault(optRoundoffIncumbent)),
+            if (exactInputs) "exact inputs" else "rounded inputs").mkString(", ") +
+        s", solvers ${context.options.findOptionOrDefault(inox.optSelectedSolvers).mkString(",")}"
+      )(using DebugSectionRoundoff)
+    }
   }
-
-  /** The witnesses, and beside them the program and the configuration the fuzzer reads.
-    *
-    * All three take their name from the file the witnesses were asked for, because the
-    * fuzzer finds a program from its configuration by that very rule.
-    */
-  private def writeFuzzerInput(file: java.io.File): Unit = {
-    stainless.utils.JsonUtils.writeFile(file,
-      Witness.report(ibex.witnesses, name => parametersOf.getOrElse(name, Seq.empty)))
-    if (subjects.nonEmpty) writeSubjects(file)
-  }
-
-  private def write(file: java.io.File, content: String): Unit = {
-    val out = new java.io.FileWriter(file)
-    try out.write(content) finally out.close()
-  }
-
-  /** The program and the configuration for every `@fuzz` function, beside `base`.
-    *
-    * @return the configuration, which is what the fuzzer is pointed at
-    */
-  private def writeSubjects(base: java.io.File): java.io.File = {
-    val found = ibex.witnesses.groupBy(_.function)
-    val conf = sibling(base, "conf")
-
-    write(sibling(base, "scala"), subjects.map(_._2).mkString("\n"))
-    write(conf, FuzzConfEmitter.emit(subjects.map {
-      case (subject, _) => subject -> found.getOrElse(subject.name, Seq.empty)
-    }))
-    conf
-  }
-
-  /** Where the fuzzer's input goes when no witnesses were asked to be written out. */
-  private lazy val scratch: java.io.File = {
-    val directory = java.nio.file.Files.createTempDirectory("stainless-roundoff").toFile
-    directory.deleteOnExit()
-    new java.io.File(directory, "roundoff.json")
-  }
-
-  /** Fuzzes all functions to compute a lower bound worst-case roundoff error for each of them
-    */
-  private lazy val fuzzed: Either[String, Map[String, BigDecimal]] =
-    if (!fuzzer.enabled || subjects.isEmpty) Left("the fuzzer was not run")
-    else
-      scala.util.Try(
-        phases.fuzzing.run(fuzzer.run(writeSubjects(witnessFile.getOrElse(scratch)))))
-        .fold(e => Left(s"the fuzzer could not be run: ${e.getMessage}"), identity)
-
-  /** The lower bound returned by the fuzzer on a specific function. */
-  private def fuzz(fd: FunDef): Option[BigDecimal] =
-    if (!fuzzer.enabled || subjects.isEmpty) None
-    else
-      fuzzed.flatMap(_.get(fd.id.name).toRight("the fuzzer reported nothing for it")) match {
-        case Right(error) => Some(error)
-        case Left(why) =>
-          reporter.warning(fd.getPos, s"No fuzzed error for ${fd.id.asString}: $why")
-          None
-      }
-
-  private def sibling(file: java.io.File, extension: String): java.io.File = {
-    val name = file.getName
-    val base = name.lastIndexOf('.') match { case -1 => name; case dot => name.take(dot) }
-    new java.io.File(file.getParentFile, s"$base.$extension")
-  }
-
-
-
-
 }

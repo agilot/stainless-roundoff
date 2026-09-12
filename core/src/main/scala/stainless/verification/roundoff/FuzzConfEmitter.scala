@@ -4,29 +4,16 @@ package stainless
 package verification
 package roundoff
 
-/** One function handed to the fuzzer, as the configuration writer sees it.
-  *
-  * `domain` holds one range per parameter, in the order they are declared, because a
-  * configuration names its intervals by position rather than by variable.
-  */
+/** One function handed to the fuzzer, with its parameters and their ranges */
 case class FuzzSubject(name: String, parameters: Seq[String], domain: Seq[(Double, Double)])
 
-/** Writes what the analysis established as a configuration the fuzzer can search.
-  *
-  * Each bounded divergence becomes a box to sample, and the precondition becomes the
-  * domain, which is both what the rounding search covers and what an end the analysis left
-  * open falls back to.
-  */
+/** Writes the intervals output by the static analysis as a configuration the fuzzer can search. */
 object FuzzConfEmitter {
 
   /** How many inputs the fuzzer tries in each configuration. */
   private val samples = 10000
 
-  /** How far a certified box is widened before it is searched.
-    *
-    * Ibex narrows a box to a couple of ulps, and the fuzzer clamps its mutations back into
-    * the box it was given, so searching one as certified never looks around the witness.
-    */
+  /** How far a certified box is widened before it is searched.*/
   private val widening = 1000
 
   def emit(subjects: Seq[(FuzzSubject, Seq[Witness])]): String = {
