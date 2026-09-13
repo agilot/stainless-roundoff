@@ -4,7 +4,7 @@ package stainless
 package verification
 package roundoff
 
-import trees._
+import trees.*
 
 object Preprocessor {
 
@@ -16,7 +16,7 @@ object Preprocessor {
     * pushes it down the bindings and branches until it meets the constructors at the leaves.
     */
   def apply(fd: FunDef)(using Symbols)
-    : Either[String, (Expr, Seq[ResultPath], Flattening)] =
+    : Either[String, (Expr, Seq[AccessPath], Flattening)] =
     for {
       raw <- exprOps.withoutSpecs(fd.fullBody).toRight("function has no body")
       // Calls come out first, so that a conditional or a selection arriving from a
@@ -33,8 +33,8 @@ object Preprocessor {
       // of its sides, where each side is a constructor of its own.
       whole = foldConstructors(liftConditionals(unfoldSelections(fields)))
 
-      paths = ResultPath.of(fd.returnType)
-      _ <- Either.cond(paths.nonEmpty, (), ResultPath.refusal(fd.returnType))
+      paths = AccessPath.list(fd.returnType)
+      _ <- Either.cond(paths.nonEmpty, (), AccessPath.errorMessage(fd.returnType))
 
       // Checked one field at a time, since what the analysis can read is a number's own
       // computation and the constructor holding it is not part of that.
@@ -56,7 +56,7 @@ object Preprocessor {
     * at the leaves, which is the fold that already reads a field off an object built and taken
     * apart again — here with the taking apart supplied rather than written.
     */
-  def project(e: Expr, path: ResultPath)(using Symbols): Expr =
+  def project(e: Expr, path: AccessPath)(using Symbols): Expr =
     if (path.steps.isEmpty) e else foldConstructors(path.select(e))
 
   private def traverse[A, B](xs: Seq[A])(f: A => Either[String, B]): Either[String, Seq[B]] =
@@ -326,5 +326,74 @@ object Preprocessor {
     }
 
     rec(body)
+  }
+}
+
+/** Selector type. */
+enum Selector {
+  case Index(at: Int)
+  case Field(id: Identifier)
+
+  def name: String = this match {
+    case Index(at) => s"_$at"
+    case Field(id) => id.name
+  }
+
+  def select(e: Expr): Expr = this match {
+    case Index(at) => TupleSelect(e, at)
+    case Field(id) => ADTSelector(e, id)
+  }
+}
+
+/** Sequence of tuple projections or case class field selections */
+case class AccessPath(steps: Seq[Selector]) {
+  def displayName: String = steps.map(_.name).mkString(".")
+  def select(e: Expr): Expr = steps.foldLeft(e)((inner, step) => step.select(inner))
+}
+
+object AccessPath {
+
+  val nil: AccessPath = AccessPath(Seq.empty)
+
+  /** Every floating-point access path in a given type */
+  def list(tpe: Type)(using symbols: Symbols): Seq[AccessPath] = {
+    def rec(tpe: Type, pathBuilder: Seq[Selector], seen: Set[Identifier]): Seq[AccessPath] =
+      tpe match {
+        case FPType(_, _) => Seq(AccessPath(pathBuilder))
+
+        case TupleType(bases) =>
+          bases.zipWithIndex.flatMap { case (base, at) =>
+            rec(base, pathBuilder :+ Selector.Index(at + 1), seen)
+          }
+
+        // Avoid infinite recursion
+        case adt: ADTType if !seen(adt.id) =>
+          adt.getSort.constructors match {
+            case Seq(only) =>
+              only.fields.flatMap(field =>
+                rec(field.getType, pathBuilder :+ Selector.Field(field.id), seen + adt.id))
+            case _ => Seq.empty
+          }
+
+        case _ => Seq.empty
+      }
+    rec(tpe, Seq.empty, Set.empty)
+  }
+
+  def errorMessage(tpe: Type)(using Symbols): String = tpe match {
+    case adt: ADTType if adt.getSort.constructors.size > 1 =>
+      s"the result is a '${adt.id.name}', which has more than one constructor, so which " +
+      "fields a value of it has is not known from its type"
+    case _ if isCompound(tpe) =>
+      "nothing in the result of this function is a floating-point number"
+    case _ =>
+      "the result of this function is not a floating-point number"
+  }
+
+  /** Whether `tpe` is a result the analysis takes apart rather than one value. */
+  def isCompound(tpe: Type): Boolean = tpe match {
+    case TupleType(_) => true
+    case _: ADTType => true
+    case _ => false
   }
 }

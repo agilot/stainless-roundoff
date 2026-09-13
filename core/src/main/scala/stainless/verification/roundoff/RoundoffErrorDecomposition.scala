@@ -553,13 +553,8 @@ enum RoundingError {
   */
 case class Shape(guards: Int, paths: Int, depth: Int, distinct: Int)
 
-/** The parts a function's roundoff error is built from.
-  *
-  * A run misses the exact result by the rounding along its path plus the distance to the
-  * path it should have taken; `leaves` and `guards` give the first, `discontinuities` the
-  * second.
-  */
-case class ErrorDecomposition(
+/** The parts a function's roundoff error is built from. */
+case class RoundoffErrorDecomposition(
   leaves: Seq[RoundingError],
   shape: Shape,
   flattening: Flattening,
@@ -569,19 +564,15 @@ case class ErrorDecomposition(
   spec: InputSpec,
   body: Expr
 ) {
-  /** The leaves a run can round, which are the only ones its error is made of. */
   def reachableLeaves: Seq[RoundingError] =
     leaves.filterNot(_ == RoundingError.Unreachable)
-
-  /** How many leaves no input reaches. */
-  def unreachableCount: Int = leaves.count(_ == RoundingError.Unreachable)
 
   def queries: Seq[RoundingQuery] =
     (reachableLeaves ++ guardOperandErrors.flatMap { case (lhs, rhs) => Seq(lhs, rhs) })
       .flatMap(_.asQuery)
 }
 
-object ErrorDecomposition {
+object RoundoffErrorDecomposition {
 
   /** @param timers where each phase reports how long it took; detached by default, so a
     *               caller with no context of its own measures nothing
@@ -591,7 +582,7 @@ object ErrorDecomposition {
          timers: inox.utils.TimerStorage = inox.utils.TimerStorage(),
          normalise: Boolean = true,
          pathRanges: Boolean = true)(using Symbols)
-    : Either[String, Seq[(ResultPath, ErrorDecomposition)]] =
+    : Either[String, Seq[(AccessPath, RoundoffErrorDecomposition)]] =
     for {
       read <- timers.preprocessing.run(Preprocessor(fd))
       (whole, fields, flattening) = read
@@ -629,9 +620,9 @@ object ErrorDecomposition {
       answered <- traverse(fields) { field =>
         val paths = walked.map(path =>
           path.copy(leaf = Preprocessor.project(path.leaf, field)))
-        val named = if (field.steps.isEmpty) fd.id.name else s"${fd.id.name}.${field.label}"
+        val named = if (field.steps.isEmpty) fd.id.name else s"${fd.id.name}.${field.displayName}"
         val tag = if (field.steps.isEmpty) prefix(fd)
-                  else s"${prefix(fd)}_${field.label.replace('.', '_')}"
+                  else s"${prefix(fd)}_${field.displayName.replace('.', '_')}"
 
         for {
           // The ranges each leaf is bounded over, which the guards above it can narrow.
@@ -660,7 +651,7 @@ object ErrorDecomposition {
                    else timers.encoding.run(
                           DiscontinuityEncoder(guards, paths, spec, mode, normalise))
           (differences, plan) = built
-        } yield field -> ErrorDecomposition(
+        } yield field -> RoundoffErrorDecomposition(
           leaves,
           Shape(guards.size, paths.size,
                 paths.map(_.choices.size).maxOption.getOrElse(0),

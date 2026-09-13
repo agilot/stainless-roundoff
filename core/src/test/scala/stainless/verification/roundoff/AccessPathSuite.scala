@@ -12,7 +12,7 @@ import stainless.trees._
   * The error of several numbers is several errors, so a result is taken apart before anything
   * is measured. Nothing here needs a solver.
   */
-class ResultPathSuite extends AnyFunSuite {
+class AccessPathSuite extends AnyFunSuite {
 
   private val f64 = FPType(11, 53)
   private val rm = RoundNearestTiesToEven
@@ -46,11 +46,11 @@ class ResultPathSuite extends AnyFunSuite {
 
   private given Symbols = NoSymbols.withSorts(Seq(reading, span, answer))
 
-  private def labels(tpe: Type): Seq[String] = ResultPath.of(tpe).map(_.label)
+  private def labels(tpe: Type): Seq[String] = AccessPath.of(tpe).map(_.displayName)
 
   test("a result that is one number is one path, with nothing to say about it") {
-    assert(ResultPath.of(f64) == Seq(ResultPath.whole))
-    assert(ResultPath.of(f64).map(_.label) == Seq(""))
+    assert(AccessPath.of(f64) == Seq(AccessPath.nil))
+    assert(AccessPath.of(f64).map(_.displayName) == Seq(""))
   }
 
   test("a tuple is taken apart by position, one-based as a selector reads it") {
@@ -71,13 +71,13 @@ class ResultPathSuite extends AnyFunSuite {
   }
 
   test("a class with more than one constructor is not taken apart") {
-    assert(ResultPath.of(ADTType(answerId, Seq())).isEmpty)
-    assert(ResultPath.refusal(ADTType(answerId, Seq())).contains("more than one constructor"))
+    assert(AccessPath.of(ADTType(answerId, Seq())).isEmpty)
+    assert(AccessPath.refusal(ADTType(answerId, Seq())).contains("more than one constructor"))
   }
 
   test("a result holding no number at all yields nothing") {
-    assert(ResultPath.of(BooleanType()).isEmpty)
-    assert(ResultPath.of(TupleType(Seq(BooleanType(), IntegerType()))).isEmpty)
+    assert(AccessPath.of(BooleanType()).isEmpty)
+    assert(AccessPath.of(TupleType(Seq(BooleanType(), IntegerType()))).isEmpty)
   }
 
   test("projecting reads the field off a constructor on every branch") {
@@ -86,7 +86,7 @@ class ResultPathSuite extends AnyFunSuite {
       ADT(reading.constructors.head.id, Seq(), Seq(e, BooleanLiteral(flag)))
     val body = IfExpr(FPLessThan(x, y), built(FPAdd(rm, x, y), true), built(FPMul(rm, x, y), false))
 
-    val path = ResultPath.of(ADTType(readingId, Seq())).head
+    val path = AccessPath.of(ADTType(readingId, Seq())).head
     assert(Preprocessor.project(body, path) ==
              IfExpr(FPLessThan(x, y), FPAdd(rm, x, y), FPMul(rm, x, y)))
   }
@@ -95,12 +95,12 @@ class ResultPathSuite extends AnyFunSuite {
     val held = ValDef.fresh("held", TupleType(Seq(f64, f64)))
     val body = Let(held, Tuple(Seq(FPAdd(rm, x, y), FPSub(rm, x, y))), held.toVariable)
 
-    val second = ResultPath.of(TupleType(Seq(f64, f64)))(1)
+    val second = AccessPath.of(TupleType(Seq(f64, f64)))(1)
     assert(Preprocessor.project(body, second) == FPSub(rm, x, y))
   }
 
   test("the empty path is the body itself, untouched") {
     val body = FPAdd(rm, x, y)
-    assert(Preprocessor.project(body, ResultPath.whole) == body)
+    assert(Preprocessor.project(body, AccessPath.nil) == body)
   }
 }
