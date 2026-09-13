@@ -84,7 +84,7 @@ class DaisyRunner(ctx: inox.Context) extends RoundingAnalyzer {
       // Daisy exits non-zero when any function failed, yet still reports the others, so
       // the results file and not the exit code says whether the run produced anything.
       if (csv.isFile) Right(parseCsv(Files.readAllLines(csv.toPath).asScala.toSeq))
-      else Left(s"Daisy exited with code $exit" + firstError(output).fold("")(": " + _))
+      else Left(s"Daisy exited with code $exit" + firstError(output).map(": " + _).getOrElse(""))
     } catch {
       case e: java.io.IOException => Left(s"could not run Daisy: ${e.getMessage}")
       case e: InterruptedException =>

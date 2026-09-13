@@ -87,10 +87,14 @@ private[roundoff] object Poly {
 
     def capped(p: Poly): Option[Poly] = Option.when(p.terms.size <= limit)(p)
 
+    /** Both sides read, then combined, so long as the result is still worth carrying. */
+    def combine(a: RExpr, b: RExpr)(f: (Poly, Poly) => Poly): Option[Poly] =
+      rec(a).flatMap(x => rec(b).flatMap(y => capped(f(x, y))))
+
     def rec(e: RExpr): Option[Poly] = e match {
-      case Plus(a, b) => for { x <- rec(a); y <- rec(b); r <- capped(x + y) } yield r
-      case Minus(a, b) => for { x <- rec(a); y <- rec(b); r <- capped(x - y) } yield r
-      case Times(a, b) => for { x <- rec(a); y <- rec(b); r <- capped(x * y) } yield r
+      case Plus(a, b) => combine(a, b)(_ + _)
+      case Minus(a, b) => combine(a, b)(_ - _)
+      case Times(a, b) => combine(a, b)(_ * _)
       case UMinus(a) => rec(a).map(-_)
       case FractionLiteral(n, d) => Some(constant(Rat.of(n, d)))
 

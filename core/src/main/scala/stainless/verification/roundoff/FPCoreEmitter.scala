@@ -6,7 +6,6 @@ package roundoff
 
 import trees._
 
-/** An integer literal of any width, possibly negated. */
 private[roundoff] object IntLit {
   def unapply(e: Expr): Option[BigInt] = e match {
     case Int8Literal(n) => Some(BigInt(n))
@@ -19,33 +18,23 @@ private[roundoff] object IntLit {
   }
 }
 
-/** A floating-point constant, seen through the wrappers the frontend puts around it. */
 private[roundoff] object FPLit {
   def unapply(e: Expr): Option[Double] = e match {
     case Float64Literal(d) => Some(d)
     case Float32Literal(f) => Some(f.toDouble)
-
-    // The frontend turns an integer written among floating-point operands into a cast,
-    // which is only the value it names while the precision it casts to holds that exactly.
     case FPCast(_, significand, _, IntLit(n)) if n.abs <= BigInt(2).pow(significand) =>
       Some(n.toDouble)
-
     case FPUMinus(FPLit(d)) => Some(-d)
     case Assert(_, _, FPLit(d)) => Some(d)
     case Annotated(FPLit(d), _) => Some(d)
-
     case _ => None
   }
 }
 
 private[roundoff] object Fraction {
 
-  /** The exact fraction a double stands for, as numerator and denominator.
-    *
-    * Read from the binary form, because the decimal form of a double runs to hundreds
-    * of digits that a solver can only round.
-    */
-  def ofDouble(d: Double): Either[String, (BigInt, BigInt)] =
+  /** The exact fraction a double stands for */
+  def apply(d: Double): Either[String, (BigInt, BigInt)] =
     if (d.isNaN || d.isInfinite) Left(s"non-finite literal ($d)")
     else if (d == 0.0) Right((BigInt(0), BigInt(1)))
     else {
@@ -68,58 +57,47 @@ private[roundoff] object Fraction {
       }
     }
 
-  /** The same as [[ofDouble]], but as an Inox literal. */
-  def literal(d: Double): inox.trees.Expr = ofDouble(d) match {
+  /** The same as [[apply]], but as an Inox literal. */
+  def toExpr(d: Double): inox.trees.Expr = apply(d) match {
     case Right((numerator, denominator)) => inox.trees.FractionLiteral(numerator, denominator)
     case Left(why) => throw new IllegalArgumentException(why)
   }
+
+  def toFPCore(d: Double): Either[String, String] =
+    Fraction(d).map { case (numerator, denominator) =>
+      if (denominator == 1) numerator.toString else s"$numerator/$denominator"
+    }
 }
 
 /** Writes a floating-point expression as an FPCore definition. */
 object FPCoreEmitter {
 
   private case class Bounds(low: Option[Double], high: Option[Double]) {
-    def withLow(d: Double) = Bounds(Some(low.fold(d)(math.min(_, d))), high)
-    def withHigh(d: Double) = Bounds(low, Some(high.fold(d)(math.max(_, d))))
+    def withLow(d: Double) = Bounds(Some(low.map(math.min(_, d)).getOrElse(d)), high)
+    def withHigh(d: Double) = Bounds(low, Some(high.map(math.max(_, d)).getOrElse(d)))
   }
 
   private object Bounds { val empty = Bounds(None, None) }
 
-  /** Reads what every query about `fd` shares: its precision, and its input ranges.
-    *
-    * A range can be written in either of two places and they are read as one. A function says what
-    * it takes in its own precondition; a class says what its fields hold in its invariant, and a
-    * function given one of those objects is entitled to both. The invariant is not folded into the
-    * precondition by the time this runs, so it is fetched from the type and instantiated here.
-    */
-  def specOf(fd: FunDef, body: Expr, flattening: Flattening)(using Symbols)
+  /** Range of all floating-point variables of the program */
+  def specOf(fd: FunDef, body: Expr, flattening: ADTParametersFlattening)(using Symbols)
     : Either[String, InputSpec] =
-    for {
-      precision <- uniformPrecision(body)
-    } yield {
+    uniformPrecision(body).map { precision =>
       val bounds = extractRanges(assumptions(fd, flattening))
-      // A half-open range is no more usable than a missing one, and dropping it here lets
-      // `emit` name the input that is missing one.
+      // A half-open range is no more usable than a missing one
       val ranges = bounds.collect { case (id, Bounds(Some(low), Some(high))) => id -> (low, high) }
       InputSpec(precision, ranges)
     }
 
-  /** Everything a function may take for granted about what it was given, as one expression over
-    * the values its fields became.
-    */
-  def assumptions(fd: FunDef, flattening: Flattening)(using Symbols): Expr = {
+  /** Preconditions of the functions and invariants of its parameters */
+  def assumptions(fd: FunDef, flattening: ADTParametersFlattening)(using Symbols): Expr = {
     val stated = fd.precondition.map(Preprocessor.stripAnnotations).toSeq ++ invariants(flattening)
-    flattening.substitute(andJoin(stated))
+    flattening.substituteAccessPaths(andJoin(stated))
   }
 
-  /** What every object a field is read through promises about itself.
-    *
-    * Only the objects actually passed through are asked, so a type that holds one of its own kind
-    * is followed exactly as far as the body reads it. Assuming an invariant is sound: Stainless
-    * discharges it wherever such a value is built.
-    */
-  private def invariants(flattening: Flattening)(using symbols: Symbols): Seq[Expr] =
-    flattening.objects.flatMap { obj =>
+  /** Invariants of the ADT parameters of the function */
+  private def invariants(flattening: ADTParametersFlattening)(using symbols: Symbols): Seq[Expr] =
+    flattening.enclosingObjects.flatMap { obj =>
       obj.getType match {
         case adt: ADTType =>
           adt.getSort.invariant.flatMap { inv =>
@@ -148,8 +126,8 @@ object FPCoreEmitter {
       // says whether the literal becomes the input's ceiling or its floor.
       val bound: Option[(Identifier, Boolean, Double)] =
         (resolved(guard.lhs), resolved(guard.rhs)) match {
-          case (Input(id), Literal(d)) => Some((id, choice.taken, d))
-          case (Literal(d), Input(id)) => Some((id, !choice.taken, d))
+          case (Input(id), FPLit(d)) => Some((id, choice.taken, d))
+          case (FPLit(d), Input(id)) => Some((id, !choice.taken, d))
           case _ => None
         }
 
@@ -177,10 +155,6 @@ object FPCoreEmitter {
     case other => other
   }
 
-  private object Literal {
-    def unapply(e: Expr): Option[Double] = FPLit.unapply(e)
-  }
-
   private object Input {
     def unapply(e: Expr): Option[Identifier] = e match {
       case v: Variable => Some(v.id)
@@ -194,36 +168,36 @@ object FPCoreEmitter {
 
     val inputs = exprOps.variablesOf(expr).toSeq.sortBy(_.id.globalId)
 
-    for {
-      _ <- if (inputs.nonEmpty) Right(()) else Left("no floating-point inputs to bound")
+    // Daisy silently drops a function whose inputs are not all bounded.
+    val unbounded = inputs.find(v => !spec.ranges.contains(v.id))
 
-      // Daisy silently drops a function whose inputs are not all bounded.
-      _ <- inputs.find(v => !spec.ranges.contains(v.id)) match {
-             case Some(v) => Left(s"no range in the precondition for '${v.id.name}'; " +
-               "add bounds of the form 'lo <= x && x <= hi'")
-             case None => Right(())
-           }
-
-      precondition <- traverse(inputs) { v =>
-                        val (low, high) = spec.ranges(v.id)
-                        for { l <- numeral(low); h <- numeral(high) }
-                          yield s"(<= $l ${symbol(v.id)}) (<= ${symbol(v.id)} $h)"
-                      }
-
-      body <- convert(expr, inputs.map(_.id).toSet)
-    } yield {
-      s"""|(FPCore $name (${inputs.map(v => symbol(v.id)).mkString(" ")})
-          | :name "$label"
-          | :pre (and ${precondition.mkString(" ")})
-          | $body)
-          |""".stripMargin
-    }
+    if (inputs.isEmpty)
+      Left("no floating-point inputs to bound")
+    else if (unbounded.isDefined)
+      Left(s"no range in the precondition for '${unbounded.get.id.name}'; " +
+           "add bounds of the form 'lo <= x && x <= hi'")
+    else
+      bounds(inputs, spec).flatMap { precondition =>
+        convert(expr, inputs.map(_.id).toSet).map { body =>
+          s"""|(FPCore $name (${inputs.map(v => symbol(v.id)).mkString(" ")})
+              | :name "$label"
+              | :pre (and ${precondition.mkString(" ")})
+              | $body)
+              |""".stripMargin
+        }
+      }
   }
 
-  /** Collects the `variable op literal` bounds a precondition states.
-    *
-    * Anything else, including disjunctions and comparisons between two variables, is
-    * ignored, which widens the box and stays sound.
+  /** The precondition Daisy is given: what every input is known to lie between. */
+  private def bounds(inputs: Seq[Variable], spec: InputSpec): Either[String, Seq[String]] =
+    traverse(inputs) { v =>
+      val (low, high) = spec.ranges(v.id)
+      Fraction.toFPCore(low).flatMap { l =>
+        Fraction.toFPCore(high).map(h => s"(<= $l ${symbol(v.id)}) (<= ${symbol(v.id)} $h)")
+      }
+    }
+
+  /** Extract numerical ranges from a precondition
     */
   private def extractRanges(precondition: Expr): Map[Identifier, Bounds] = {
     var found = Map.empty[Identifier, Bounds].withDefaultValue(Bounds.empty)
@@ -274,7 +248,7 @@ object FPCoreEmitter {
     found
   }
 
-  /** The single precision an expression runs at, since FPCore cannot state one per variable. */
+  /** The precision an expression runs at, since FPCore cannot state one per variable. */
   private def uniformPrecision(body: Expr)(using Symbols): Either[String, FPPrecision] = {
     val types = exprOps.collect[Type] { e =>
       val declared: Set[Type] = e match {
@@ -297,15 +271,6 @@ object FPCoreEmitter {
     }
   }
 
-  /** Writes a double as an exact FPCore numeral, sign included.
-    *
-    * The sign has to be part of the numeral, because Daisy only reads a range bound that
-    * is literally a number and would not see one wrapped in a unary minus.
-    */
-  private def numeral(d: Double): Either[String, String] =
-    Fraction.ofDouble(d).map { case (numerator, denominator) =>
-      if (denominator == 1) numerator.toString else s"$numerator/$denominator"
-    }
 
   private def symbol(id: Identifier): String = s"v_${id.globalId}"
 
@@ -317,21 +282,16 @@ object FPCoreEmitter {
     case _ => "unknown"
   }
 
-  private def roundsToNearest(mode: Expr): Either[String, Unit] = mode match {
-    case RoundNearestTiesToEven => Right(())
-    case other => Left(s"unsupported rounding mode (${roundingModeName(other)}); " +
-      "Daisy assumes round-to-nearest-ties-to-even")
-  }
-
   private def convert(e: Expr, inScope: Set[Identifier]): Either[String, String] = {
     def binary(op: String, l: Expr, r: Expr): Either[String, String] =
-      for { a <- convert(l, inScope); b <- convert(r, inScope) } yield s"($op $a $b)"
+      convert(l, inScope).flatMap(a => convert(r, inScope).map(b => s"($op $a $b)"))
 
     def rounded(op: String, mode: Expr, args: Expr*): Either[String, String] =
-      for {
-        _ <- roundsToNearest(mode)
-        as <- traverse(args)(convert(_, inScope))
-      } yield s"($op ${as.mkString(" ")})"
+      mode match {
+        case RoundNearestTiesToEven => nary(op, args)
+        case other => Left(s"unsupported rounding mode (${roundingModeName(other)}); " +
+          "Daisy assumes round-to-nearest-ties-to-even")
+      }
 
     def nary(op: String, args: Seq[Expr]): Either[String, String] =
       traverse(args)(convert(_, inScope)).map(as => s"($op ${as.mkString(" ")})")
@@ -340,7 +300,7 @@ object FPCoreEmitter {
       case v: Variable =>
         if (inScope(v.id)) Right(symbol(v.id)) else Left(s"unbound variable '${v.id.name}'")
 
-      case FPLit(d) => numeral(d)
+      case FPLit(d) => Fraction.toFPCore(d)
 
       case FPAdd(mode, l, r) => rounded("+", mode, l, r)
       case FPSub(mode, l, r) => rounded("-", mode, l, r)
@@ -351,17 +311,12 @@ object FPCoreEmitter {
       case TranscendentalFunctionCall(f, args) => nary(f.symbol, args)
 
       case Let(vd, value, body) =>
-        for {
-          v <- convert(value, inScope)
-          b <- convert(body, inScope + vd.id)
-        } yield s"(let ([${symbol(vd.id)} $v]) $b)"
+        convert(value, inScope).flatMap { v =>
+          convert(body, inScope + vd.id).map(b => s"(let ([${symbol(vd.id)} $v]) $b)")
+        }
 
       case IfExpr(condition, thenBranch, elseBranch) =>
-        for {
-          c <- convert(condition, inScope)
-          t <- convert(thenBranch, inScope)
-          f <- convert(elseBranch, inScope)
-        } yield s"(if $c $t $f)"
+        nary("if", Seq(condition, thenBranch, elseBranch))
 
       case FPLessThan(l, r)      => binary("<", l, r)
       case FPLessEquals(l, r)    => binary("<=", l, r)

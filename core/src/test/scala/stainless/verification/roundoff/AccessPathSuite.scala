@@ -38,19 +38,21 @@ class AccessPathSuite extends AnyFunSuite {
   /** `sealed abstract class Answer` with two cases, one of them carrying a number. */
   private val known = ValDef.fresh("known", f64)
   private val answerId = FreshIdentifier("Answer")
+  private val knownId = FreshIdentifier("Known")
+  private val absentId = FreshIdentifier("Absent")
   private val answer =
     new ADTSort(answerId, Seq(),
-                Seq(new ADTConstructor(FreshIdentifier("Known"), answerId, Seq(known)),
-                    new ADTConstructor(FreshIdentifier("Absent"), answerId, Seq())),
+                Seq(new ADTConstructor(knownId, answerId, Seq(known)),
+                    new ADTConstructor(absentId, answerId, Seq())),
                 Seq())
 
   private given Symbols = NoSymbols.withSorts(Seq(reading, span, answer))
 
-  private def labels(tpe: Type): Seq[String] = AccessPath.of(tpe).map(_.displayName)
+  private def labels(tpe: Type): Seq[String] = AccessPath.list(tpe).map(_.displayName)
 
   test("a result that is one number is one path, with nothing to say about it") {
-    assert(AccessPath.of(f64) == Seq(AccessPath.nil))
-    assert(AccessPath.of(f64).map(_.displayName) == Seq(""))
+    assert(AccessPath.list(f64) == Seq(AccessPath.nil))
+    assert(AccessPath.list(f64).map(_.displayName) == Seq(""))
   }
 
   test("a tuple is taken apart by position, one-based as a selector reads it") {
@@ -71,13 +73,13 @@ class AccessPathSuite extends AnyFunSuite {
   }
 
   test("a class with more than one constructor is not taken apart") {
-    assert(AccessPath.of(ADTType(answerId, Seq())).isEmpty)
-    assert(AccessPath.refusal(ADTType(answerId, Seq())).contains("more than one constructor"))
+    assert(AccessPath.list(ADTType(answerId, Seq())).isEmpty)
+    assert(AccessPath.errorMessage(ADTType(answerId, Seq())).contains("more than one constructor"))
   }
 
   test("a result holding no number at all yields nothing") {
-    assert(AccessPath.of(BooleanType()).isEmpty)
-    assert(AccessPath.of(TupleType(Seq(BooleanType(), IntegerType()))).isEmpty)
+    assert(AccessPath.list(BooleanType()).isEmpty)
+    assert(AccessPath.list(TupleType(Seq(BooleanType(), IntegerType()))).isEmpty)
   }
 
   test("projecting reads the field off a constructor on every branch") {
@@ -86,8 +88,8 @@ class AccessPathSuite extends AnyFunSuite {
       ADT(reading.constructors.head.id, Seq(), Seq(e, BooleanLiteral(flag)))
     val body = IfExpr(FPLessThan(x, y), built(FPAdd(rm, x, y), true), built(FPMul(rm, x, y), false))
 
-    val path = AccessPath.of(ADTType(readingId, Seq())).head
-    assert(Preprocessor.project(body, path) ==
+    val path = AccessPath.list(ADTType(readingId, Seq())).head
+    assert(path.project(body) ==
              IfExpr(FPLessThan(x, y), FPAdd(rm, x, y), FPMul(rm, x, y)))
   }
 
@@ -95,12 +97,30 @@ class AccessPathSuite extends AnyFunSuite {
     val held = ValDef.fresh("held", TupleType(Seq(f64, f64)))
     val body = Let(held, Tuple(Seq(FPAdd(rm, x, y), FPSub(rm, x, y))), held.toVariable)
 
-    val second = AccessPath.of(TupleType(Seq(f64, f64)))(1)
-    assert(Preprocessor.project(body, second) == FPSub(rm, x, y))
+    val second = AccessPath.list(TupleType(Seq(f64, f64)))(1)
+    assert(second.project(body) == FPSub(rm, x, y))
   }
 
   test("the empty path is the body itself, untouched") {
     val body = FPAdd(rm, x, y)
-    assert(Preprocessor.project(body, AccessPath.nil) == body)
+    assert(AccessPath.nil.project(body) == body)
+  }
+
+  test("a selection meeting a constructor that holds no such field is left alone") {
+    // The same selection against the constructor that does hold the field, so that what
+    // follows tells the guard apart from the selection never reaching a constructor at all.
+    val held = ADT(knownId, Seq(), Seq(FPAdd(rm, x, y)))
+    assert(Preprocessor.resolveADTSelections(ADTSelector(held, known.id)) == FPAdd(rm, x, y))
+
+    // `Absent` carries nothing, so selecting `Known`'s field meets no field to take.
+    val absent = ADT(absentId, Seq(), Seq())
+    val fromAbsent = ADTSelector(absent, known.id)
+    assert(Preprocessor.resolveADTSelections(fromAbsent) == fromAbsent)
+
+    // One side of the branch holds the field and the other does not, so neither is selected:
+    // what is left has to be an expression, not a selection sitting on one branch.
+    val either = IfExpr(FPLessThan(x, y), ADT(knownId, Seq(), Seq(FPAdd(rm, x, y))), absent)
+    val fromEither = ADTSelector(either, known.id)
+    assert(Preprocessor.resolveADTSelections(fromEither) == fromEither)
   }
 }

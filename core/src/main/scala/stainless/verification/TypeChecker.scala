@@ -1495,7 +1495,7 @@ class TypeChecker(val program: StainlessProgram, val context: inox.Context, val 
           // several errors. A result that is one number gives one, unlabelled, as before.
           // Read off the declared type: freshening renames what a body binds, and the names
           // of a result's fields belong to its type rather than to this function.
-          val fields = roundoff.AccessPath.of(fd.returnType)
+          val fields = roundoff.AccessPath.list(fd.returnType)
           val labels =
             if (fields.size <= 1) Seq(None) else fields.map(path => Some(path.displayName))
 
@@ -1540,7 +1540,7 @@ class TypeChecker(val program: StainlessProgram, val context: inox.Context, val 
       else bodyOpt match {
         case Some(body) =>
           // Every number the result holds, so a pair of doubles is asked about as a pair.
-          roundoff.AccessPath.of(freshenedReturnType) match {
+          roundoff.AccessPath.list(freshenedReturnType) match {
             case Seq() => TyperResult.valid
             case fields =>
               val res = ValDef.fresh("res", freshenedReturnType)

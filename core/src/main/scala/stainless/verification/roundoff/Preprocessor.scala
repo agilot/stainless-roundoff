@@ -6,62 +6,41 @@ package roundoff
 
 import trees.*
 
+import scala.annotation.tailrec
+
 object Preprocessor {
 
-  /** The body as the analysis reads it, one expression per number in the result.
-    *
-    * Everything up to the projection is done once: the paths of a result are read off the same
-    * computation however it is taken apart, so inlining, flattening and lifting are shared and
-    * only the last step differs. Projecting is the fold again, on a selector at the root, which
-    * pushes it down the bindings and branches until it meets the constructors at the leaves.
-    */
   def apply(fd: FunDef)(using Symbols)
-    : Either[String, (Expr, Seq[AccessPath], Flattening)] =
-    for {
-      raw <- exprOps.withoutSpecs(fd.fullBody).toRight("function has no body")
-      // Calls come out first, so that a conditional or a selection arriving from a
-      // callee meets the same rewrites as one written here.
-      called <- inlineCalls(raw)
-      // A thing built and taken apart again is what it was built from. Done before the fields,
-      // so that one read off a constructor is followed to whatever the constructor was given.
-      built = foldConstructors(stripAnnotations(called))
-      // Then the fields, so that what follows only ever sees values. After inlining, since a
-      // callee reads its own name for an object; before the rest, since they know no fields.
-      read <- Flattening.of(fd, built)
-      (fields, flattening) = read
-      // And again once conditionals are lifted: a selector that sat on a branch now sits on each
-      // of its sides, where each side is a constructor of its own.
-      whole = foldConstructors(liftConditionals(unfoldSelections(fields)))
+    : Either[String, (Expr, Seq[AccessPath], ADTParametersFlattening)] = {
+    val paths = AccessPath.list(fd.returnType)
 
-      paths = AccessPath.list(fd.returnType)
-      _ <- Either.cond(paths.nonEmpty, (), AccessPath.errorMessage(fd.returnType))
+    if (paths.isEmpty) Left(AccessPath.errorMessage(fd.returnType))
+    else
+      exprOps.withoutSpecs(fd.fullBody).toRight("function has no body")
+        .flatMap(inlineFunctionCalls)
+        .flatMap { bodyAfterInlining =>
+          val bodyAfterADTResolution = resolveADTSelections(stripAnnotations(bodyAfterInlining))
+          ADTParametersFlattening.flatten(fd, bodyAfterADTResolution).flatMap { case (bodyAfterFlattening, newParameters) =>
+            val res = resolveADTSelections(hoistConditionals(unfoldMathOperators(bodyAfterFlattening)))
+            cannotAnalyse(res, paths).toLeft((res, paths, newParameters))
+          }
+        }
+  }
 
-      // Checked one field at a time, since what the analysis can read is a number's own
-      // computation and the constructor holding it is not part of that.
-      _ <- traverse(paths) { path =>
-             val body = project(whole, path)
-             for {
-               _ <- isUnsupported(body).toLeft(())
-               // Lifting leaves none behind, and one left behind would be measured as
-               // rounding alone, which understates the error.
-               _ <- Either.cond(!branchesInsideExpression(body), (),
-                      "a conditional remains inside an expression")
-             } yield ()
-           }
-    } yield (whole, paths, flattening)
-
-  /** `e` narrowed to one number of the result it computes.
-    *
-    * The selector is pushed down the bindings and the branches until it meets the constructors
-    * at the leaves, which is the fold that already reads a field off an object built and taken
-    * apart again — here with the taking apart supplied rather than written.
+  /** Why the analysis cannot analyse an expression
     */
-  def project(e: Expr, path: AccessPath)(using Symbols): Expr =
-    if (path.steps.isEmpty) e else foldConstructors(path.select(e))
+  private def cannotAnalyse(e: Expr, paths: Seq[AccessPath])(using Symbols): Option[String] =
+    paths.view.map(_.project(e)).flatMap { body =>
+      isUnsupported(body)
+        .orElse(Option.when(conditionalsNotHoisted(body))(
+          "a conditional remains inside an expression"))
+    }.headOption
+
+
 
   private def traverse[A, B](xs: Seq[A])(f: A => Either[String, B]): Either[String, Seq[B]] =
-    xs.foldLeft(Right(Vector.empty): Either[String, Vector[B]]) { (acc, x) =>
-      for { done <- acc; next <- f(x) } yield done :+ next
+    xs.foldLeft(Right(Vector.empty): Either[String, Vector[B]]) { (done, x) =>
+      done.flatMap(built => f(x).map(built :+ _))
     }
 
   def stripAnnotations(e: Expr): Expr = exprOps.postMap {
@@ -72,14 +51,10 @@ object Preprocessor {
     case _ => None
   }(e)
 
-  /** How many calls one body may absorb before its paths stop being worth enumerating. */
+  /** Maximum number of calls inlined. */
   private val inliningBudget = 256
 
-  /** Replaces every call the analysis holds no meaning of its own for by the body behind
-    * it, so that a computation written across several definitions is measured as the one
-    * it stands for.
-    */
-  private def inlineCalls(e: Expr)(using symbols: Symbols): Either[String, Expr] = {
+  private def inlineFunctionCalls(e: Expr)(using symbols: Symbols): Either[String, Expr] = {
     var remaining = inliningBudget
 
     def descend(e: Expr): Either[String, Expr] = e match {
@@ -99,110 +74,91 @@ object Preprocessor {
         case Opaque => "opaque"
       }
 
-      for {
-        _ <- Either.cond(remaining > 0, (),
-               s"inlining passed $inliningBudget calls, which is more than the analysis " +
-                 "can enumerate paths through")
-        _ <- Either.cond(!symbols.isRecursive(call.id), (),
-               s"'$name' is recursive, so inlining it reaches no finite body")
-        _ <- hidden.map(flag => s"'$name' is @$flag, so its body is hidden from the analysis")
-               .toLeft(())
-        // The callee's own precondition is dropped along with the rest of its specs: it
-        // is checked as its own obligation, and the range each parameter really takes
-        // follows from the argument bound to it.
-        body <- exprOps.withoutSpecs(call.tfd.fullBody).toRight(s"'$name' has no body")
-        _ = remaining -= 1
+      if (remaining <= 0)
+        Left(s"inlining passed $inliningBudget calls, which is more than the analysis " +
+             "can enumerate paths through")
+      else if (symbols.isRecursive(call.id))
+        Left(s"'$name' is recursive, so inlining it reaches no finite body")
+      else if (hidden.isDefined)
+        Left(s"'$name' is @${hidden.get}, so its body is hidden from the analysis")
+      else exprOps.withoutSpecs(call.tfd.fullBody) match {
+        case None => Left(s"'$name' has no body")
 
-        arguments <- traverse(call.args)(rec)
-        parameters = call.tfd.params.map(_.freshen)
-        renamed = exprOps.freshenLocals(
-                    exprOps.replaceFromSymbols(
-                      call.tfd.params.zip(parameters.map(_.toVariable)).toMap, body))
-        result <- rec(renamed)
-      } yield
-        // Parameters become bindings rather than substitutions, so an argument is
-        // computed once however often the body reads it, and two leaves that compute the
-        // same thing stay equal as trees.
-        parameters.zip(arguments).foldRight(result) {
-          case ((parameter, argument), kept) => Let(parameter, argument, kept)
-        }
+        case Some(body) =>
+          remaining -= 1
+
+          traverse(call.args)(rec).flatMap { arguments =>
+            val renamedParameters = call.tfd.params.map(_.freshen)
+            //alpha conversion
+            val renamedBody = exprOps.freshenLocals(
+                            exprOps.replaceFromSymbols(
+                              call.tfd.params.zip(renamedParameters.map(_.toVariable)).toMap, body))
+
+            // Parameters become bindings rather than substitutions
+            rec(renamedBody).map { inlinedBody =>
+              renamedParameters.zip(arguments).foldRight(inlinedBody) {
+                case ((parameter, argument), kept) => Let(parameter, argument, kept)
+              }
+            }
+          }
+      }
     }
 
     rec(e)
   }
 
-  /** Reads a thing written and immediately taken apart again as what it was written from.
-    *
-    * Imperative code arrives in this shape. Assigning to a variable on both sides of a conditional
-    * is encoded as the two sides handing back what changed, read off by position, and a callee
-    * returning several values does the same. Neither is a computation of its own: the value asked
-    * for is one of the operands the constructor was given.
-    */
-  private def foldConstructors(e: Expr)(using symbols: Symbols): Expr = {
+  /** Resolve ADT field selections and Tuple projections */
+  private[roundoff] def resolveADTSelections(e: Expr)(using Symbols): Expr = {
 
-    def rec(e: Expr, built: Map[Identifier, Expr]): Expr = {
-      // What is read arrives under whatever the bindings and branches on the way to it left
-      // there, so the reading is carried inside until it meets what it reads. The bindings it
-      // passes on the way are added to the ones it knows, since a value written down a line
-      // above and named on the next is reached through its own name.
-      def through(e: Expr, known: Map[Identifier, Expr])
-                 (read: Expr => Option[Expr]): Option[Expr] = e match {
-        case Let(vd, value, body) =>
-          through(body, known + (vd.id -> value))(read).map(Let(vd, value, _))
-        case IfExpr(condition, thenBranch, elseBranch) =>
-          for {
-            taken <- through(thenBranch, known)(read)
-            untaken <- through(elseBranch, known)(read)
-          } yield IfExpr(condition, taken, untaken)
-        case v: Variable => known.get(v.id).flatMap(through(_, known)(read))
-        case other => read(other)
-      }
+    def pushADTSelectionInto(selection: Expr, expression: Expr,bindings: Map[Identifier, Expr])
+                            (using symbols: Symbols): Option[Expr] = expression match {
+      case Let(vd, value, body) =>
+        pushADTSelectionInto(selection, body, bindings + (vd.id -> value)).map(Let(vd, value, _))
 
-      /** What a reading found, tidied: the bindings it made unnecessary are gone.
-        *
-        * Going round again is what drops them, and it terminates because a reading that found
-        * something returns a smaller tree than it was given.
-        */
-      def folded(found: Option[Expr], otherwise: => Expr): Expr =
-        found.map(rec(_, built)).getOrElse(otherwise)
+      case IfExpr(condition, thenBranch, elseBranch) =>
+        pushADTSelectionInto(selection, thenBranch, bindings).flatMap { fromThenBranch =>
+          pushADTSelectionInto(selection, elseBranch, bindings)
+            .map(IfExpr(condition, fromThenBranch, _))
+        }
 
-      e match {
-        case TupleSelect(receiver, index) =>
-          val target = rec(receiver, built)
-          folded(through(target, built) {
-            case Tuple(fields) => Some(fields(index - 1))
-            case _ => None
-          }, TupleSelect(target, index))
+      case variable: Variable =>
+        bindings.get(variable.id).flatMap(pushADTSelectionInto(selection, _, bindings))
 
-        case ADTSelector(receiver, field) =>
-          val target = rec(receiver, built)
-          folded(through(target, built) {
-            case ADT(id, _, fields) =>
-              Option.when(symbols.getConstructor(id).fields.exists(_.id == field))(
-                fields(symbols.getConstructor(id).fields.indexWhere(_.id == field)))
-            case _ => None
-          }, ADTSelector(target, field))
+      case reached =>
+        (selection, reached) match {
+          case (TupleSelect(_, index), Tuple(fields)) => Some(fields(index - 1))
 
-        case Let(vd, value, body) =>
-          val bound = rec(value, built)
-          // Every binding is remembered, and carrying a reading inside one is what decides
-          // whether it meets anything: where it does not, the reading stays where it was.
-          val rest = rec(body, built + (vd.id -> bound))
-          // Whatever was written is now in the places that read it, so the name it was given
-          // has nothing left needing it.
-          if (exprOps.variablesOf(rest).exists(_.id == vd.id)) Let(vd, bound, rest) else rest
+          case (ADTSelector(_, field), ADT(id, _, fields)) =>
+            val position = symbols.getConstructor(id).fields.indexWhere(_.id == field)
+            Option.when(position >= 0)(fields(position))
 
-        case Operator(operands, build) => build(operands.map(rec(_, built)))
-      }
+          case _ => None
+        }
+    }
+
+    def rec(e: Expr, bindings: Map[Identifier, Expr]): Expr = e match {
+      case Operator(Seq(receiver), rebuild) if AccessPath.isCompound(e) =>
+        val resolvedReceiver = rec(receiver, bindings)
+
+
+        pushADTSelectionInto(e, resolvedReceiver, bindings)
+          .map(rec(_, bindings)).getOrElse(rebuild(Seq(resolvedReceiver)))
+
+      case Let(vd, value, body) =>
+        val resolvedValue = rec(value, bindings)
+        val resolvedBody = rec(body, bindings + (vd.id -> resolvedValue))
+
+        if (exprOps.variablesOf(resolvedBody).exists(_.id == vd.id))
+          Let(vd, resolvedValue, resolvedBody)
+        else resolvedBody
+
+      case Operator(operands, build) => build(operands.map(rec(_, bindings)))
     }
 
     rec(e, Map.empty)
   }
 
-  /** Rewrites the operations that pick a value by comparing into the conditional they
-    * stand for, since neither Daisy nor the path enumeration knows them by name.
-    */
-  private def unfoldSelections(e: Expr)(using Symbols): Expr = exprOps.postMap {
+  private def unfoldMathOperators(e: Expr)(using Symbols): Expr = exprOps.postMap {
     case FPAbs(a) =>
       a.getType match {
         case FPType(exponent, significand) =>
@@ -226,57 +182,61 @@ object Preprocessor {
       Let(vd, e, build(vd.toVariable))
   }
 
-  private def hasConditional(body: Expr): Boolean =
-    exprOps.exists { case _: IfExpr => true; case _ => false }(body)
 
-  /** Rewrites a body into a tree of conditionals over straight-line leaves, so that no
-    * branch is left inside an expression where the path enumeration would miss its jump.
+
+  /** Rewrites a body into a tree of conditionals over straight-line leaves.
     */
-  def liftConditionals(e: Expr): Expr = e match {
+  private def hoistConditionals(e: Expr): Expr = e match {
     case Let(vd, value, body) =>
-      val liftedBody = liftConditionals(body)
-      distribute(Seq(liftConditionals(value)))(vs => Let(vd, vs.head, liftedBody))
+      val hoistedBody = hoistConditionals(body)
+      nest(hoistConditionals(value))(Let(vd, _, hoistedBody))
 
     case IfExpr(condition, thenBranch, elseBranch) =>
-      val liftedThen = liftConditionals(thenBranch)
-      val liftedElse = liftConditionals(elseBranch)
-      distribute(Seq(liftConditionals(condition)))(cs => IfExpr(cs.head, liftedThen, liftedElse))
+      val liftedThen = hoistConditionals(thenBranch)
+      val liftedElse = hoistConditionals(elseBranch)
+      nest(hoistConditionals(condition))(IfExpr(_, liftedThen, liftedElse))
 
-    case Operator(operands, build) => distribute(operands.map(liftConditionals))(build)
+    case Operator(operands, build) => nest(operands.map(hoistConditionals))(build)
   }
 
-  /** Moves the leftmost conditional among already lifted operands above the node they
-    * belong to, and repeats until none is left.
+  /** Moves the leftmost conditional among already hoisted operands above the node they belong
+    * to, and repeats until none is left: `f(a, if (c) x else y)` becomes
+    * `if (c) f(a, x) else f(a, y)`.
     */
-  private def distribute(operands: Seq[Expr])(build: Seq[Expr] => Expr): Expr = {
-    def above(i: Int): Option[Expr] = operands(i) match {
-      case IfExpr(condition, thenBranch, elseBranch) =>
-        Some(IfExpr(condition,
-                    distribute(operands.updated(i, thenBranch))(build),
-                    distribute(operands.updated(i, elseBranch))(build)))
+  private def nest(operands: Seq[Expr])(build: Seq[Expr] => Expr): Expr = {
+    // The whole node, built again with operand `i` standing for what was lifted off it.
+    def nodeWith(i: Int, operand: Expr): Expr = nest(operands.updated(i, operand))(build)
 
-      // The branches mention what the binding binds, so it has to come out with them.
-      case Let(vd, value, body) if branchesAtTop(body) =>
-        Some(Let(vd, value, distribute(operands.updated(i, body))(build)))
+    val lifted = operands.zipWithIndex.collectFirst {
+      case (IfExpr(condition, thenBranch, elseBranch), i) =>
+        IfExpr(condition, nodeWith(i, thenBranch), nodeWith(i, elseBranch))
 
-      case _ => None
+      case (Let(vd, value, body), i) if isTopLevelConditional(body) =>
+        Let(vd, value, nodeWith(i, body))
     }
 
-    operands.indices.view.flatMap(above).headOption.getOrElse(build(operands))
+    lifted.getOrElse(build(operands))
   }
 
-  private def branchesAtTop(e: Expr): Boolean = e match {
+  private def nest(operand: Expr)(build: Expr => Expr): Expr =
+    nest(Seq(operand))(operands => build(operands.head))
+
+  @tailrec
+  private def isTopLevelConditional(e: Expr): Boolean = e match {
     case _: IfExpr => true
-    case Let(_, _, body) => branchesAtTop(body)
+    case Let(_, _, body) => isTopLevelConditional(body)
     case _ => false
   }
 
-  /** Whether a conditional sits anywhere other than on the spine of bindings and branches. */
-  private def branchesInsideExpression(e: Expr): Boolean = e match {
-    case Let(_, value, body) => hasConditional(value) || branchesInsideExpression(body)
+  private def hasConditional(body: Expr): Boolean =
+    exprOps.exists { case _: IfExpr => true; case _ => false }(body)
+
+  /** Whether a conditional sits in a guard or a let binding */
+  private def conditionalsNotHoisted(e: Expr): Boolean = e match {
+    case Let(_, value, body) => hasConditional(value) || conditionalsNotHoisted(body)
     case IfExpr(condition, thenBranch, elseBranch) =>
       hasConditional(condition) ||
-        branchesInsideExpression(thenBranch) || branchesInsideExpression(elseBranch)
+        conditionalsNotHoisted(thenBranch) || conditionalsNotHoisted(elseBranch)
     case other => hasConditional(other)
   }
 
@@ -329,6 +289,110 @@ object Preprocessor {
   }
 }
 
+case class PointedAccessPath(root: Variable, path: AccessPath) {
+
+  def name: String =
+    if (path.steps.isEmpty) root.id.name else s"${root.id.name}_${path.displayName("_")}"
+
+  /** The objects passed through on the way. */
+  def enclosingObjects: Seq[Expr] =
+    path.steps.inits.toSeq.drop(1).reverse.map(AccessPath(_).select(root))
+
+  /** This path with one more step taken from where it ends. */
+  def append(step: Selector): PointedAccessPath = PointedAccessPath(root, path.append(step))
+}
+
+/** Introduce additional parameters to represent ADT and Tuple selectors */
+case class ADTParametersFlattening(accessPathVariables: Map[PointedAccessPath, Variable], parameters: Seq[ValDef]) {
+
+  def substituteAccessPaths(e: Expr)(using Symbols): Expr =
+    ADTParametersFlattening.replacePathsWithVariables(e, accessPathVariables)
+
+  /** The objects every path passes through, each of which may carry an invariant of its own. */
+  def enclosingObjects: Seq[Expr] =
+    accessPathVariables.keys.flatMap(_.enclosingObjects).toSeq.distinct
+}
+
+object ADTParametersFlattening {
+
+  def flatten(fd: FunDef, body: Expr)(using Symbols): Either[String, (Expr, ADTParametersFlattening)] = {
+    val parameterIds = fd.params.map(_.id).toSet
+    val accessPathVariables = scala.collection.mutable.LinkedHashMap.empty[PointedAccessPath, Variable]
+
+    def accessPathVariable(path: PointedAccessPath, tpe: Type): Variable =
+      accessPathVariables.getOrElseUpdate(path, Variable.fresh(path.name, tpe))
+
+    def rec(e: Expr, bindings: Map[Identifier, PointedAccessPath]): Either[String, Expr] = e match {
+      case selection if AccessPath.isCompound(selection) && TypeCheckerUtils.isFloatType(selection.getType) =>
+        toPointedAccessPath(selection, bindings) match {
+          case Some(path) if parameterIds(path.root.id) =>
+            Right(accessPathVariable(path, selection.getType))
+          case Some(path) =>
+            Left(s"'${path.name}' is read off '${path.root.id.name}', which is not one " +
+              s"of the values '${fd.id.name}' was given")
+          case None =>
+            Left("a field is read off something the analysis cannot follow back to a parameter")
+        }
+
+      case Let(vd, value, body) =>
+        val updatedBindings = toPointedAccessPath(value, bindings)
+          .map(path => bindings + (vd.id -> path)).getOrElse(bindings)
+
+        rec(value, bindings).flatMap { flattenedValue =>
+          rec(body, updatedBindings).map { flattenedBody =>
+            if (TypeCheckerUtils.isFloatType(vd.tpe) || exprOps.variablesOf(flattenedBody).exists(_.id == vd.id))
+              Let(vd, flattenedValue, flattenedBody)
+            else flattenedBody
+          }
+        }
+
+      case Operator(operands, build) => traverse(operands)(rec(_, bindings)).map(build)
+    }
+
+    rec(body, Map.empty).map { flattenedBody =>
+      val parameters = fd.params.flatMap { parameter =>
+        if (TypeCheckerUtils.isFloatType(parameter.tpe)) Seq(parameter)
+        else
+          accessPathVariables.collect {
+            case (path, variable) if path.root.id == parameter.id => path.name -> variable
+          }.toSeq.sortBy(_._1).map(_._2.toVal)
+      }
+
+      (flattenedBody, ADTParametersFlattening( accessPathVariables.toMap, parameters))
+    }
+  }
+
+  private def toPointedAccessPath(e: Expr, bindings: Map[Identifier, PointedAccessPath]): Option[PointedAccessPath] =
+    e match {
+      case variable: Variable =>
+        Some(bindings.getOrElse(variable.id, PointedAccessPath(variable, AccessPath.nil)))
+      case ADTSelector(receiver, field) =>
+        toPointedAccessPath(receiver, bindings).map(_.append(Selector.Field(field)))
+      case TupleSelect(receiver, index) =>
+        toPointedAccessPath(receiver, bindings).map(_.append(Selector.Index(index)))
+      case _ => None
+    }
+
+  private def replacePathsWithVariables(e: Expr, variableOfPath: Map[PointedAccessPath, Variable])
+                                       (using Symbols): Expr = {
+    def rec(e: Expr, bindings: Map[Identifier, PointedAccessPath]): Expr = e match {
+      case Operator(Seq(receiver), rebuild) if AccessPath.isCompound(e) =>
+        toPointedAccessPath(e, bindings).flatMap(variableOfPath.get)
+          .getOrElse(rebuild(Seq(rec(receiver, bindings))))
+
+      case Let(vd, value, body) =>
+        val inner = toPointedAccessPath(value, bindings)
+          .map(path => bindings + (vd.id -> path)).getOrElse(bindings)
+        Let(vd, rec(value, bindings), rec(body, inner))
+
+      case Operator(operands, build) => build(operands.map(rec(_, bindings)))
+    }
+
+    rec(e, Map.empty)
+  }
+
+}
+
 /** Selector type. */
 enum Selector {
   case Index(at: Int)
@@ -347,8 +411,15 @@ enum Selector {
 
 /** Sequence of tuple projections or case class field selections */
 case class AccessPath(steps: Seq[Selector]) {
-  def displayName: String = steps.map(_.name).mkString(".")
+  def displayName: String = displayName(".")
+  def displayName(separator: String): String = steps.map(_.name).mkString(separator)
   def select(e: Expr): Expr = steps.foldLeft(e)((inner, step) => step.select(inner))
+  def append(step: Selector): AccessPath = AccessPath(steps :+ step)
+
+  /** `e` narrowed to a projection of the result it computes.
+   */
+  def project(e: Expr)(using Symbols): Expr =
+    if (steps.isEmpty) e else Preprocessor.resolveADTSelections(select(e))
 }
 
 object AccessPath {
@@ -394,6 +465,11 @@ object AccessPath {
   def isCompound(tpe: Type): Boolean = tpe match {
     case TupleType(_) => true
     case _: ADTType => true
+    case _ => false
+  }
+
+  def isCompound(e: Expr): Boolean = e match {
+    case _: TupleSelect | _: ADTSelector => true
     case _ => false
   }
 }

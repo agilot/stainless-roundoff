@@ -12,7 +12,7 @@ import stainless.verification.roundoff._
   * Nothing here needs a solver: the oracle is a stub that records what it was asked and
   * refuses whatever it is told to.
   */
-class ReachabilitySuite extends AnyFunSuite {
+class ReachabilitySuite extends AnyFunSuite with Unwrapping {
 
   private val f64 = FPType(11, 53)
 
@@ -40,7 +40,7 @@ class ReachabilitySuite extends AnyFunSuite {
 
   private def extract(body: Expr, oracle: BranchOracle)
     : (Seq[Guard], Seq[ProgramPath]) =
-    PathExtractor(body, oracle).fold(why => fail(why), identity)
+    PathExtractor(body, oracle).orFail
 
   test("an equality is the two comparisons that make it, so it marks two bands") {
     val (guards, paths) = extract(IfExpr(FPEquals(a, b), one, two), BranchOracle.open)
@@ -80,7 +80,7 @@ class ReachabilitySuite extends AnyFunSuite {
   }
 
   test("the default oracle is the open one, so an unasked caller sees no change") {
-    val (_, paths) = PathExtractor(nested).fold(why => fail(why), identity)
+    val (_, paths) = PathExtractor(nested).orFail
     assert(paths.map(_.leaf) == Seq(one, two, three))
     assert(paths.forall(_.reachable))
   }

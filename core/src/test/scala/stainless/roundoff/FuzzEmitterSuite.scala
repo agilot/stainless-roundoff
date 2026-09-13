@@ -10,7 +10,7 @@ import stainless.verification.roundoff._
 /** Covers what the fuzzer is handed: the program written for it, and the configuration
   * that says where to look.
   */
-class FuzzEmitterSuite extends AnyFunSuite {
+class FuzzEmitterSuite extends AnyFunSuite with Unwrapping {
 
   private val f64 = FPType(11, 53)
   private val rm = RoundNearestTiesToEven
@@ -43,18 +43,18 @@ class FuzzEmitterSuite extends AnyFunSuite {
   }
 
   test("a program is marked, and takes its parameters in the order they are declared") {
-    val source = emit(shared).fold(fail(_), identity)
+    val source = emit(shared).orFail
     assert(source.startsWith("@fuzz\n"))
     assert("""def denoise\(a_\d+: Double, b_\d+: Double\): Double""".r.findFirstIn(source).isDefined)
   }
 
   test("the precondition travels with the program") {
-    val source = emit(shared).fold(fail(_), identity)
+    val source = emit(shared).orFail
     assert("""require\(\(0\.1 <= a_\d+ && a_\d+ <= 10\.0\)""".r.findFirstIn(source).isDefined)
   }
 
   test("bindings of the same source name are named apart") {
-    val source = emit(shared).fold(fail(_), identity)
+    val source = emit(shared).orFail
     val bound = """val (t_\d+):""".r.findAllMatchIn(source).map(_.group(1)).toList
     assert(bound.size == 2, s"expected two bindings in\n$source")
     assert(bound.distinct.size == 2, s"the two bindings share a name in\n$source")
@@ -63,7 +63,7 @@ class FuzzEmitterSuite extends AnyFunSuite {
   test("floating-point arithmetic keeps the shape it was written in") {
     // a - (a - b) is not (a - a) - b, so the inner subtraction has to stay parenthesised.
     val nested = FPSub(rm, a, FPSub(rm, a, b))
-    val source = emit(nested).fold(fail(_), identity)
+    val source = emit(nested).orFail
     assert("""a_\d+ - \(a_\d+ - b_\d+\)""".r.findFirstIn(source).isDefined, source)
   }
 
@@ -71,7 +71,7 @@ class FuzzEmitterSuite extends AnyFunSuite {
     // The tree printer writes `===`, which tells floating-point equality apart from structural
     // equality for a reader. What is emitted here is compiled, and `===` is not an operator on
     // doubles at all.
-    val source = emit(IfExpr(FPEquals(a, b), a, b)).fold(fail(_), identity)
+    val source = emit(IfExpr(FPEquals(a, b), a, b)).orFail
 
     assert(!source.contains("==="), source)
     assert("""a_\d+ == b_\d+""".r.findFirstIn(source).isDefined, source)
@@ -82,7 +82,7 @@ class FuzzEmitterSuite extends AnyFunSuite {
     // fuzzer promotes the double type and its literals and leaves a cast from an integer
     // alone, so the two sides of that comparison end up different types.
     val source = emit(IfExpr(FPLessEquals(a, ToDouble(Int32Literal(10))), a, b))
-                   .fold(fail(_), identity)
+                   .orFail
 
     assert(!source.contains("toDouble"), source)
     assert(source.contains("10.0"), source)

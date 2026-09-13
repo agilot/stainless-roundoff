@@ -67,7 +67,7 @@ object DaisyProbe {
       val built = for {
         read <- Preprocessor(fd)
         (whole, fields, flattening) = read
-        body = Preprocessor.project(whole, fields.head)
+        body = fields.head.project(whole)
         spec <- FPCoreEmitter.specOf(fd, body, flattening)
         source <- FPCoreEmitter.emit(fd.id.name, fd.id.name, body, spec)
       } yield RoundingQuery(fd.id, fd.id.name, spec.precision, source)

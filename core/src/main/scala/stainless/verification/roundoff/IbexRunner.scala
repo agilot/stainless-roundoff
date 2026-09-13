@@ -136,8 +136,9 @@ class IbexRunner(ctx: inox.Context, recordWitnesses: Boolean) {
             traverse(comparisons)(
               referenceDistance(_, region.reference, guardDifferences, guardErrors, site))
 
-          for { near <- measured(region.taken); far <- measured(region.untaken) }
-            yield (near, far)
+          measured(region.taken).flatMap { near =>
+            measured(region.untaken).map(far => (near, far))
+          }
         })
 
         searched.map { case (near, far) =>
@@ -189,7 +190,7 @@ class IbexRunner(ctx: inox.Context, recordWitnesses: Boolean) {
     * are within their combined error of each other.
     */
   private def band(guard: Int, error: BigDecimal, guardDifferences: Seq[Seq[Expr]]): Seq[Expr] = {
-    val width = Fraction.literal(roundedUp(error))
+    val width = Fraction.toExpr(roundedUp(error))
     guardDifferences(guard).flatMap { difference =>
       Seq(LessEquals(difference, width), LessEquals(UMinus(difference), width))
     }
@@ -278,7 +279,7 @@ class IbexRunner(ctx: inox.Context, recordWitnesses: Boolean) {
     optimizer.push()
     try {
       choices.foreach { choice =>
-        val width = Fraction.literal(roundedUp(guardErrors(choice.guard)))
+        val width = Fraction.toExpr(roundedUp(guardErrors(choice.guard)))
         guardDifferences(choice.guard).foreach { difference =>
           optimizer.assertCnstr(
             LessEquals(if (choice.taken) difference else UMinus(difference), width))
@@ -319,13 +320,12 @@ class IbexRunner(ctx: inox.Context, recordWitnesses: Boolean) {
 
     // Whatever the emptiness check left goes to the two ends, which share it evenly.
     val each = budget * (1.0 - feasibilityShare) / 2.0
-    for {
-      high <- extremum(objective, maximizing = true, each, bounded)
-      low <- extremum(objective, maximizing = false, each, bounded)
-    } yield {
-      val bound = high.abs max low.abs
-      if (bound > widest) widest = bound
-      Verdict(DivergenceStatus.Bounded, bound)
+    extremum(objective, maximizing = true, each, bounded).flatMap { high =>
+      extremum(objective, maximizing = false, each, bounded).map { low =>
+        val bound = high.abs max low.abs
+        if (bound > widest) widest = bound
+        Verdict(DivergenceStatus.Bounded, bound)
+      }
     }
   }
 
@@ -333,7 +333,7 @@ class IbexRunner(ctx: inox.Context, recordWitnesses: Boolean) {
     * a no rather than a figure, and so is settled where working the figure out would not be.
     */
   private def reaches(objective: Expr, target: BigDecimal, budget: Double): Boolean = {
-    val far = Fraction.literal(target.toDouble)
+    val far = Fraction.toExpr(target.toDouble)
 
     def possible(side: Expr): Boolean = {
       optimizer.push()

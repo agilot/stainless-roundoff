@@ -50,7 +50,7 @@ class FuzzRunner(ctx: inox.Context) {
           // A run that found nothing has failed at something.
           if (observed.nonEmpty) Right(observed)
           else Left(s"the fuzzer exited with code $exit and reported no error" +
-            lastLine(output).fold("")(l => s": $l"))
+            lastLine(output).map(l => s": $l").getOrElse(""))
         } catch {
           case e: java.io.IOException => Left(s"could not run the fuzzer: ${e.getMessage}")
           case e: InterruptedException =>
@@ -73,7 +73,7 @@ class FuzzRunner(ctx: inox.Context) {
 
       case ((Some(function), found), observation(value)) =>
         val widest = Try(BigDecimal(value)).toOption.map { error =>
-          function -> found.get(function).fold(error)(_ max error)
+          function -> found.get(function).map(_ max error).getOrElse(error)
         }
         (Some(function), found ++ widest)
 
@@ -140,7 +140,7 @@ object FuzzConfEmitter {
       }
     }.mkString(", ")
 
-  private def end(d: Option[BigDecimal]): String = d.fold("*")(_.toString)
+  private def end(d: Option[BigDecimal]): String = d.map(_.toString).getOrElse("*")
 }
 
 /** Writes a preprocessed function as a subject program for the fuzzer.
@@ -161,17 +161,20 @@ object FuzzProgramEmitter {
 
     val precondition = Option(assumptions).filterNot(_ == BooleanLiteral(true))
 
-    for {
-      _ <- Either.cond(spec.precision == FPPrecision.Binary64, (),
-        "the fuzzer runs subject programs in double precision")
-      _ <- (fd.returnType +: values.map(_.tpe))
-        .find(tpe => !FPPrecision.fromType(tpe).contains(FPPrecision.Binary64))
-        .map(_ => "the fuzzer passes and returns doubles only")
-        .toLeft(())
-      _ <- (unsupported(body) orElse precondition.flatMap(unsupported)).toLeft(())
-    } yield {
+    val doublesThroughout = (fd.returnType +: values.map(_.tpe))
+      .forall(tpe => FPPrecision.fromType(tpe).contains(FPPrecision.Binary64))
+
+    // The first reason the fuzzer cannot be given this function, where there is one.
+    val refused =
+      Option.when(spec.precision != FPPrecision.Binary64)(
+          "the fuzzer runs subject programs in double precision")
+        .orElse(Option.when(!doublesThroughout)("the fuzzer passes and returns doubles only"))
+        .orElse(unsupported(body))
+        .orElse(precondition.flatMap(unsupported))
+
+    refused.toLeft {
       val parameters = values.map(show).mkString(", ")
-      val block = written(precondition.fold(body)(Require(_, body)))
+      val block = written(precondition.map(Require(_, body)).getOrElse(body))
 
       s"""|@fuzz
           |def $name($parameters): ${show(fd.returnType)} = {
@@ -250,4 +253,5 @@ object FuzzProgramEmitter {
     }
   }
 }
+
 

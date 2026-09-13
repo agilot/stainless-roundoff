@@ -76,10 +76,8 @@ object PathExtractor {
               val index = guards.size
               val closed = Guard(close(inner, guard.lhs), close(inner, guard.rhs), guard.strict)
               guards += closed
-              for {
-                _ <- descend(closed, taken = true, thenBranch, inner, choices, index, live)
-                _ <- descend(closed, taken = false, elseBranch, inner, choices, index, live)
-              } yield ()
+              descend(closed, taken = true, thenBranch, inner, choices, index, live).flatMap(_ =>
+                descend(closed, taken = false, elseBranch, inner, choices, index, live))
             }
         }
 
@@ -252,24 +250,28 @@ object DiscontinuityEncoder {
     val realVariables: Map[Identifier, inox.trees.Variable] =
       inputs.map(v => v.id -> inox.trees.Variable(v.id, inox.trees.RealType(), Seq.empty)).toMap
 
-    for {
-      _ <- inputs.map(_.id).find(!spec.ranges.contains(_)) match {
-             case Some(id) => Left(s"no range in the precondition for '${id.name}'; " +
-               "add bounds of the form 'lo <= x && x <= hi'")
-             case None => Right(())
-           }
-      leaves <- traverse(paths)(path => RealEncoder(path.leaf, realVariables))
-      guardOperands <- traverse(guards) { guard =>
-                         for {
-                           lhs <- RealEncoder(guard.lhs, realVariables)
-                           rhs <- RealEncoder(guard.rhs, realVariables)
-                         } yield (lhs, rhs)
-                       }
-    } yield {
+    val unbounded = inputs.map(_.id).find(!spec.ranges.contains(_))
+
+    // The leaves and the two sides of every guard, all read as real arithmetic.
+    val encoded: Either[String, (Seq[inox.trees.Expr], Seq[(inox.trees.Expr, inox.trees.Expr)])] =
+      if (unbounded.isDefined)
+        Left(s"no range in the precondition for '${unbounded.get.name}'; " +
+             "add bounds of the form 'lo <= x && x <= hi'")
+      else
+        traverse(paths)(path => RealEncoder(path.leaf, realVariables)).flatMap { leaves =>
+          traverse(guards) { guard =>
+            RealEncoder(guard.lhs, realVariables).flatMap { lhs =>
+              RealEncoder(guard.rhs, realVariables).map((lhs, _))
+            }
+          }.map((leaves, _))
+        }
+
+    encoded.map { case (leaves, guardOperands) =>
+
       val ranges = inputs.flatMap { input =>
         val (low, high) = spec.ranges(input.id)
-        Seq(inox.trees.LessEquals(Fraction.literal(low), realVariables(input.id)),
-            inox.trees.LessEquals(realVariables(input.id), Fraction.literal(high)))
+        Seq(inox.trees.LessEquals(Fraction.toExpr(low), realVariables(input.id)),
+            inox.trees.LessEquals(realVariables(input.id), Fraction.toExpr(high)))
       }
 
       /** What a guard is worth, as written. */
@@ -337,9 +339,9 @@ object DiscontinuityEncoder {
 
       /** An objective written over the guard it turns out to be a multiple of. */
       def objective(e: inox.trees.Expr): inox.trees.Expr =
-        divisorOf(e).fold(e) { case (guard, quotient) =>
+        divisorOf(e).map { case (guard, quotient) =>
           inox.trees.Times(quotient, named(guard))
-        }
+        }.getOrElse(e)
 
       /** The path condition one choice contributes. */
       def pathCondition(choice: BranchChoice): inox.trees.Expr = {
@@ -445,12 +447,12 @@ private[roundoff] object RealEncoder {
     : Either[String, inox.trees.Expr] = {
 
     def binary(build: (inox.trees.Expr, inox.trees.Expr) => inox.trees.Expr, l: Expr, r: Expr) =
-      for { a <- apply(l, realVariables); b <- apply(r, realVariables) } yield build(a, b)
+      apply(l, realVariables).flatMap(a => apply(r, realVariables).map(build(a, _)))
 
     e match {
       case v: Variable => realVariables.get(v.id).toRight(s"unbound variable '${v.id.name}'")
       case FPLit(d) =>
-        Fraction.ofDouble(d).map { case (num, den) => inox.trees.FractionLiteral(num, den) }
+        Fraction.apply(d).map { case (num, den) => inox.trees.FractionLiteral(num, den) }
 
       // Rounding modes are irrelevant: this is the exact computation the rounded one is
       // measured against.
@@ -460,15 +462,17 @@ private[roundoff] object RealEncoder {
       case FPDiv(_, l, r) => binary(Division(_, _), l, r)
       case FPUMinus(a) => apply(a, realVariables).map(UMinus(_))
       case FPFMA(_, a, b, c) =>
-        for { x <- apply(a, realVariables); y <- apply(b, realVariables); z <- apply(c, realVariables) }
-          yield Plus(Times(x, y), z)
+        binary(Times(_, _), a, b).flatMap { product =>
+          apply(c, realVariables).map(Plus(product, _))
+        }
 
       case Let(vd, value, body) =>
         val realVar = inox.trees.Variable(vd.id, inox.trees.RealType(), Seq.empty)
-        for {
-          realValue <- apply(value, realVariables)
-          realBody <- apply(body, realVariables + (vd.id -> realVar))
-        } yield inox.trees.Let(realVar.toVal, realValue, realBody)
+
+        apply(value, realVariables).flatMap { realValue =>
+          apply(body, realVariables + (vd.id -> realVar)).map(
+            inox.trees.Let(realVar.toVal, realValue, _))
+        }
 
       case TranscendentalFunctionCall(f, args) =>
         traverse(args)(apply(_, realVariables)).flatMap(realCall(f, _))
@@ -557,7 +561,7 @@ case class Shape(guards: Int, paths: Int, depth: Int, distinct: Int)
 case class RoundoffErrorDecomposition(
   leaves: Seq[RoundingError],
   shape: Shape,
-  flattening: Flattening,
+  flattening: ADTParametersFlattening,
   guardOperandErrors: Seq[(RoundingError, RoundingError)],
   guardDifferences: Seq[Seq[inox.trees.Expr]],
   discontinuities: DiscontinuityPlan,
@@ -582,84 +586,133 @@ object RoundoffErrorDecomposition {
          timers: inox.utils.TimerStorage = inox.utils.TimerStorage(),
          normalise: Boolean = true,
          pathRanges: Boolean = true)(using Symbols)
-    : Either[String, Seq[(AccessPath, RoundoffErrorDecomposition)]] =
-    for {
-      read <- timers.preprocessing.run(Preprocessor(fd))
-      (whole, fields, flattening) = read
-      spec <- timers.preprocessing.run(FPCoreEmitter.specOf(fd, whole, flattening))
-      _ = oracle.knowing(flattening.parameters, FPCoreEmitter.assumptions(fd, flattening))
-      // Two questions per guard, counted by walking the body once with nothing asked of it.
-      // The walk is the same one that follows and finds the same guards, so the figure is
-      // exact for a run that refutes nothing and an over-estimate for one that does.
-      _ = oracle.expecting(timers.pruning.counting.run(
-            PathExtractor(whole).fold(_ => 0, _._1.size * 2)))
-      // Enumerated once for the whole result. Every number in it is computed by the same
-      // branches, so the guards, the questions asked about them and the errors of their
-      // operands are shared, and only the leaves are read one field at a time.
-      (guards, walked) <- timers.paths.run(PathExtractor(whole, oracle))
+    : Either[String, Seq[(AccessPath, RoundoffErrorDecomposition)]] = {
+    val options = DecompositionOptions(exactInputs, mode, normalise, pathRanges, timers)
 
-      // Every leaf refused leaves the function with nothing a run can compute, which is what
-      // an unsatisfiable precondition looks like from here.
-      _ <- Either.cond(walked.exists(_.reachable), (),
-             "no path through this function is reachable, so its precondition may be " +
-             "unsatisfiable; --sat-precond checks that on its own")
+    read(fd, oracle, options).flatMap(reading => traverse(reading.fields)(reading.decompose(_)))
+  }
 
-      guardNames = guards.distinct.zipWithIndex.toMap
-      operandErrors <- timers.queries.conditions.run(traverse(guards) { guard =>
-                         val k = guardNames(guard)
-                         for {
-                           lhs <- errorOf(fd, s"${prefix(fd)}_guard${k}_lhs",
-                                          s"${fd.id.name} (guard ${k + 1}, left)",
-                                          guard.lhs, spec, exactInputs)
-                           rhs <- errorOf(fd, s"${prefix(fd)}_guard${k}_rhs",
-                                          s"${fd.id.name} (guard ${k + 1}, right)",
-                                          guard.rhs, spec, exactInputs)
-                         } yield (lhs, rhs)
-                       })
+  /** What the caller asked for, carried unchanged through the reading of one function. */
+  private case class DecompositionOptions(exactInputs: Boolean, mode: DiscontinuityMode,
+                                          normalise: Boolean, pathRanges: Boolean,
+                                          timers: inox.utils.TimerStorage)
 
-      answered <- traverse(fields) { field =>
-        val paths = walked.map(path =>
-          path.copy(leaf = Preprocessor.project(path.leaf, field)))
-        val named = if (field.steps.isEmpty) fd.id.name else s"${fd.id.name}.${field.displayName}"
-        val tag = if (field.steps.isEmpty) prefix(fd)
-                  else s"${prefix(fd)}_${field.displayName.replace('.', '_')}"
+  /** What one function's body came to, before its result is read one number at a time.
+    *
+    * The body is enumerated once for the whole result: every number in it is computed by the
+    * same branches, so the guards, the questions asked about them and the errors of their
+    * operands are shared, and only the leaves are read field by field.
+    */
+  private def read(fd: FunDef, oracle: BranchOracle, options: DecompositionOptions)(using Symbols)
+    : Either[String, Reading] = {
+    import options.timers
 
-        for {
-          // The ranges each leaf is bounded over, which the guards above it can narrow.
-          leafSpecs <- Right(paths.map(path =>
-                         if (pathRanges) FPCoreEmitter.narrowed(spec, guards, path.choices)
-                         else spec))
+    timers.preprocessing.run(Preprocessor(fd)).flatMap { case (whole, fields, flattening) =>
+      timers.preprocessing.run(FPCoreEmitter.specOf(fd, whole, flattening)).flatMap { spec =>
+        brief(oracle, fd, whole, flattening, timers)
 
-          // A connective written out as nesting repeats what it guards, so one expression can
-          // appear on several paths and only needs analyzing once. What is asked about is the
-          // expression over a range, so two paths share a query only where both agree.
-          leafKeys = paths.map(_.leaf).zip(leafSpecs.map(_.ranges))
-          leafNames = leafKeys.distinct.zipWithIndex.toMap
-
-          leaves <- timers.queries.branches.run(traverse(paths.indices) { i =>
-                      if (!paths(i).reachable) Right(RoundingError.Unreachable)
-                      else {
-                        val k = leafNames(leafKeys(i))
-                        errorOf(fd, s"${tag}_leaf$k", s"$named (leaf ${k + 1})",
-                                paths(i).leaf, leafSpecs(i), exactInputs)
-                      }
-                    })
-          // Without guards there is no other path to take, so no region has to be built.
-          built <- if (guards.isEmpty)
-                     Right((Seq.empty[Seq[inox.trees.Expr]],
-                            DiscontinuityPlan.Pairwise(Seq.empty)))
-                   else timers.encoding.run(
-                          DiscontinuityEncoder(guards, paths, spec, mode, normalise))
-          (differences, plan) = built
-        } yield field -> RoundoffErrorDecomposition(
-          leaves,
-          Shape(guards.size, paths.size,
-                paths.map(_.choices.size).maxOption.getOrElse(0),
-                paths.map(_.leaf).distinct.size),
-          flattening, operandErrors, differences, plan, spec,
-          Preprocessor.project(whole, field))
+        timers.paths.run(PathExtractor(whole, oracle)).flatMap { case (guards, paths) =>
+          // Every leaf refused leaves the function with nothing a run can compute, which is
+          // what an unsatisfiable precondition looks like from here.
+          if (!paths.exists(_.reachable))
+            Left("no path through this function is reachable, so its precondition may be " +
+                 "unsatisfiable; --sat-precond checks that on its own")
+          else
+            guardOperandErrors(fd, guards, spec, options).map(
+              Reading(fd, whole, fields, flattening, spec, guards, paths, _, options))
+        }
       }
-    } yield answered
+    }
+  }
+
+  /** Tells the oracle what the questions are about, and how many of them to expect.
+    *
+    * Two per guard, counted by walking the body once with nothing asked of it. The walk is the
+    * same one that follows and finds the same guards, so the figure is exact for a run that
+    * refutes nothing and an over-estimate for one that does.
+    */
+  private def brief(oracle: BranchOracle, fd: FunDef, whole: Expr,
+                    flattening: ADTParametersFlattening, timers: inox.utils.TimerStorage)
+                   (using Symbols): Unit = {
+    oracle.knowing(flattening.parameters, FPCoreEmitter.assumptions(fd, flattening))
+    oracle.expecting(timers.pruning.counting.run(
+      PathExtractor(whole) match {
+        case Right((guards, _)) => guards.size * 2
+        case Left(_) => 0
+      }))
+  }
+
+  /** How far the two sides of each guard can fall from their exact values. */
+  private def guardOperandErrors(fd: FunDef, guards: Seq[Guard], spec: InputSpec,
+                                 options: DecompositionOptions)(using Symbols)
+    : Either[String, Seq[(RoundingError, RoundingError)]] = {
+    val guardNames = guards.distinct.zipWithIndex.toMap
+
+    options.timers.queries.conditions.run(traverse(guards) { guard =>
+      val k = guardNames(guard)
+
+      errorOf(fd, s"${prefix(fd)}_guard${k}_lhs", s"${fd.id.name} (guard ${k + 1}, left)",
+              guard.lhs, spec, options.exactInputs).flatMap { lhs =>
+        errorOf(fd, s"${prefix(fd)}_guard${k}_rhs", s"${fd.id.name} (guard ${k + 1}, right)",
+                guard.rhs, spec, options.exactInputs).map((lhs, _))
+      }
+    })
+  }
+
+  /** One function's body, read as far as it can be without picking a number out of its result. */
+  private case class Reading(fd: FunDef, whole: Expr, fields: Seq[AccessPath],
+                             flattening: ADTParametersFlattening, spec: InputSpec,
+                             guards: Seq[Guard], paths: Seq[ProgramPath],
+                             operandErrors: Seq[(RoundingError, RoundingError)],
+                             options: DecompositionOptions) {
+
+    /** What the error of one number of the result is built from. */
+    def decompose(field: AccessPath)(using Symbols)
+      : Either[String, (AccessPath, RoundoffErrorDecomposition)] = {
+      val narrowed = paths.map(path => path.copy(leaf = field.project(path.leaf)))
+      val named = if (field.steps.isEmpty) fd.id.name else s"${fd.id.name}.${field.displayName}"
+      val tag = if (field.steps.isEmpty) prefix(fd) else s"${prefix(fd)}_${field.displayName("_")}"
+
+      // The ranges each leaf is bounded over, which the guards above it can narrow.
+      val leafSpecs = narrowed.map(path =>
+        if (options.pathRanges) FPCoreEmitter.narrowed(spec, guards, path.choices) else spec)
+
+      // A connective written out as nesting repeats what it guards, so one expression can
+      // appear on several paths and only needs analyzing once. What is asked about is the
+      // expression over a range, so two paths share a query only where both agree.
+      val leafKeys = narrowed.map(_.leaf).zip(leafSpecs.map(_.ranges))
+      val leafNames = leafKeys.distinct.zipWithIndex.toMap
+
+      val leafErrors = options.timers.queries.branches.run(traverse(narrowed.indices) { i =>
+        if (!narrowed(i).reachable) Right(RoundingError.Unreachable)
+        else {
+          val k = leafNames(leafKeys(i))
+          errorOf(fd, s"${tag}_leaf$k", s"$named (leaf ${k + 1})",
+                  narrowed(i).leaf, leafSpecs(i), options.exactInputs)
+        }
+      })
+
+      leafErrors.flatMap { leaves =>
+        regions(narrowed).map { case (differences, plan) =>
+          field -> RoundoffErrorDecomposition(
+            leaves,
+            Shape(guards.size, narrowed.size,
+                  narrowed.map(_.choices.size).maxOption.getOrElse(0),
+                  narrowed.map(_.leaf).distinct.size),
+            flattening, operandErrors, differences, plan, spec, field.project(whole))
+        }
+      }
+    }
+
+    /** The regions a divergence is searched in. Without guards there is no other path to
+      * take, so none has to be built.
+      */
+    private def regions(narrowed: Seq[ProgramPath])(using Symbols)
+      : Either[String, (Seq[Seq[inox.trees.Expr]], DiscontinuityPlan)] =
+      if (guards.isEmpty) Right((Seq.empty, DiscontinuityPlan.Pairwise(Seq.empty)))
+      else options.timers.encoding.run(
+        DiscontinuityEncoder(guards, narrowed, spec, options.mode, options.normalise))
+  }
 
   private def errorOf(fd: FunDef, name: String, label: String, expr: Expr, spec: InputSpec,
                       exactInputs: Boolean)(using Symbols): Either[String, RoundingError] =
@@ -694,4 +747,119 @@ object RoundoffErrorDecomposition {
   }
 
   private def prefix(fd: FunDef): String = s"f_${fd.id.globalId}"
+}
+
+private[roundoff] object ConstantEvaluator {
+
+  def error(e: Expr, precision: FPPrecision): Either[String, BigDecimal] =
+    evaluate(e, Map.empty, precision).flatMap { value =>
+      if (value.rounded.isNaN || value.rounded.isInfinite)
+        Left(s"a value with no inputs is not finite (${value.rounded})")
+      else
+        Exact.ofDouble(value.rounded).map(landed => decimal((landed - value.exact).abs))
+    }
+
+  /** What the program computes, beside what the same expression is worth exactly. */
+  private case class Value(rounded: Double, exact: Exact)
+
+  private def evaluate(e: Expr, bound: Map[Identifier, Value], precision: FPPrecision)
+  : Either[String, Value] = {
+
+    /** Single precision is computed in `Float` rather than rounded from a `Double` result,
+     * which would round it twice and can land on the wrong value.
+     */
+    def binary(single: (Float, Float) => Float,
+               double: (Double, Double) => Double,
+               exact: (Exact, Exact) => Either[String, Exact])
+              (l: Expr, r: Expr): Either[String, Value] =
+      evaluate(l, bound, precision).flatMap { a =>
+        evaluate(r, bound, precision).flatMap { b =>
+          val rounded = precision match {
+            case FPPrecision.Binary32 => single(a.rounded.toFloat, b.rounded.toFloat).toDouble
+            case FPPrecision.Binary64 => double(a.rounded, b.rounded)
+          }
+          exact(a.exact, b.exact).map(Value(rounded, _))
+        }
+      }
+
+    e match {
+      // Ahead of the arithmetic, since a literal reaches here wrapped in a sign flip or a
+      // cast as readily as on its own.
+      case FPLit(d) => Exact.ofDouble(d).map(Value(d, _))
+
+      case FPAdd(_, l, r) => binary(_ + _, _ + _, (a, b) => Right(a + b))(l, r)
+      case FPSub(_, l, r) => binary(_ - _, _ - _, (a, b) => Right(a - b))(l, r)
+      case FPMul(_, l, r) => binary(_ * _, _ * _, (a, b) => Right(a * b))(l, r)
+      case FPDiv(_, l, r) => binary(_ / _, _ / _, (a, b) => a / b)(l, r)
+
+      case FPUMinus(a) => evaluate(a, bound, precision).map(v => Value(-v.rounded, -v.exact))
+
+      case FPFMA(_, a, b, c) =>
+        evaluate(a, bound, precision).flatMap { x =>
+          evaluate(b, bound, precision).flatMap { y =>
+            evaluate(c, bound, precision).map { z =>
+              val rounded = precision match {
+                case FPPrecision.Binary32 =>
+                  Math.fma(x.rounded.toFloat, y.rounded.toFloat, z.rounded.toFloat).toDouble
+                case FPPrecision.Binary64 => Math.fma(x.rounded, y.rounded, z.rounded)
+              }
+              Value(rounded, x.exact * y.exact + z.exact)
+            }
+          }
+        }
+
+      case Let(vd, value, body) =>
+        evaluate(value, bound, precision)
+          .flatMap(v => evaluate(body, bound + (vd.id -> v), precision))
+
+      case v: Variable =>
+        bound.get(v.id).toRight(s"'${v.id.name}' is not bound in a value with no inputs")
+
+      // The exact side is a fraction, and none of these is one.
+      case TranscendentalFunctionCall(f, _) =>
+        Left(s"a value with no inputs calls '${f.symbol}', which is not a fraction")
+
+      case other =>
+        Left(s"${other.getClass.getSimpleName} cannot be evaluated without inputs")
+    }
+  }
+
+  private def decimal(value: Exact): BigDecimal =
+    new BigDecimal(BigDecimal(value.numerator).bigDecimal.divide(
+      BigDecimal(value.denominator).bigDecimal, reportedPrecision), reportedPrecision)
+
+  /** A fraction in lowest terms, with the sign carried by the numerator. */
+  private case class Exact(numerator: BigInt, denominator: BigInt) {
+
+    def +(other: Exact): Exact =
+      Exact.of(numerator * other.denominator + other.numerator * denominator,
+        denominator * other.denominator)
+
+    def -(other: Exact): Exact = this + -other
+
+    def *(other: Exact): Exact =
+      Exact.of(numerator * other.numerator, denominator * other.denominator)
+
+    def /(other: Exact): Either[String, Exact] =
+      if (other.numerator == 0) Left("a value with no inputs divides by zero")
+      else Right(Exact.of(numerator * other.denominator, denominator * other.numerator))
+
+    def unary_- : Exact = Exact(-numerator, denominator)
+
+    def abs: Exact = if (numerator < 0) -this else this
+  }
+
+  private object Exact {
+
+    def of(numerator: BigInt, denominator: BigInt): Exact = {
+      val shared = numerator.gcd(denominator)
+      val divisor = if (shared == 0) BigInt(1) else shared
+      val sign = if (denominator < 0) BigInt(-1) else BigInt(1)
+      Exact(sign * numerator / divisor, sign * denominator / divisor)
+    }
+
+    /** Seeded the same way the rest of the analysis reads a literal. */
+    def ofDouble(d: Double): Either[String, Exact] =
+      Fraction.apply(d).map { case (numerator, denominator) => Exact(numerator, denominator) }
+  }
 }

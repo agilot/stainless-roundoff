@@ -242,6 +242,21 @@ package object roundoff {
     case Dominated extends DivergenceStatus("dominated")
   }
 
+  private[roundoff] final class Cake(seconds: Double, queries: Int) {
+
+    private val deadline: Long = System.nanoTime() + (seconds.max(0.0) * 1e9).toLong
+    private var pending: Int = queries
+
+    /** How long there is before the whole of it is gone. */
+    def left: Double = ((deadline - System.nanoTime()) / 1e9).max(0.0)
+
+    /** What the next query may spend: the time left over the queries left. */
+    def slice(): Double = left / pending.max(1)
+
+    /** Records that one query has had its turn, whatever it spent. */
+    def taken(): Unit = pending -= 1
+  }
+
   /** What one divergence query established.
     *
     * Every divergence considered is recorded, refused ones included, so that an empty
@@ -302,7 +317,7 @@ package object roundoff {
       * is given, whose intervals are positional.
       */
     def report(witnesses: Seq[Witness], parametersOf: String => Seq[String]): Json = {
-      def end(d: Option[BigDecimal]): Json = d.fold(Json.Null)(Json.fromBigDecimal)
+      def end(d: Option[BigDecimal]): Json = d.map(Json.fromBigDecimal).getOrElse(Json.Null)
 
       def bounds(box: Box, parameters: Seq[String]): Json = {
         // A name the function does not declare cannot be placed among the ones it does,
@@ -378,6 +393,6 @@ package object roundoff {
   private[roundoff] def traverse[A, B](as: Seq[A])(f: A => Either[String, B])
     : Either[String, Seq[B]] =
     as.foldLeft[Either[String, Seq[B]]](Right(Seq.empty)) {
-      case (acc, a) => for { bs <- acc; b <- f(a) } yield bs :+ b
+      case (done, a) => done.flatMap(built => f(a).map(built :+ _))
     }
 }

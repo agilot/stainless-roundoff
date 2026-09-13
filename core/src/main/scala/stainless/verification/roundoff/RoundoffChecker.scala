@@ -138,7 +138,8 @@ trait RoundoffChecker extends VerificationChecker {
 
   /** Display name of a given part of a VC */
   private def displayName(fid: Identifier, field: Option[String]): String =
-    field.filter(_.nonEmpty).fold(getFunction(fid).id.name)(f => s"${getFunction(fid).id.name}.$f")
+    field.filter(_.nonEmpty)
+      .map(f => s"${getFunction(fid).id.name}.$f").getOrElse(getFunction(fid).id.name)
 
   private def round(e: BigDecimal, towards: java.math.RoundingMode): String =
     e.round(new java.math.MathContext(4, towards)).toString
@@ -151,22 +152,24 @@ trait RoundoffChecker extends VerificationChecker {
       decompositions.of(fid, field).flatMap { parts =>
         val name = displayName(fid, field)
 
-        for {
-          // A guard can only be misread where its two sides are within their combined error.
-          guards <- traverse(parts.guardOperandErrors) { case (lhs, rhs) =>
-                      for { l <- errorFrom(lhs); r <- errorFrom(rhs) } yield l + r
-                    }
-          rounding <- traverse(parts.reachableLeaves)(errorFrom)
-          divergences <- search(fid, name, parts, guards)
-        } yield {
-          val worstDivergence = (BigDecimal(0) +: divergences).max
-          val worstRounding = rounding.max
+        // A guard can only be misread where its two sides are within their combined error.
+        val guards = traverse(parts.guardOperandErrors) { case (lhs, rhs) =>
+          errorFrom(lhs).flatMap(l => errorFrom(rhs).map(l + _))
+        }
 
-          describe(name, parts, divergences, worstDivergence, worstRounding)
-          // Added under a rounding of the analysis's own choosing: the default one shortens a
-          // long sum towards zero as readily as away from it, and a bound shortened towards
-          // zero is no longer a bound.
-          new BigDecimal(worstDivergence.bigDecimal, reportedPrecision) + worstRounding
+        guards.flatMap { guardErrors =>
+          traverse(parts.reachableLeaves)(errorFrom).flatMap { rounding =>
+            search(fid, name, parts, guardErrors).map { divergences =>
+              val worstDivergence = (BigDecimal(0) +: divergences).max
+              val worstRounding = rounding.max
+
+              describe(name, parts, divergences, worstDivergence, worstRounding)
+              // Added under a rounding of the analysis's own choosing: the default one shortens
+              // a long sum towards zero as readily as away from it, and a bound shortened
+              // towards zero is no longer a bound.
+              new BigDecimal(worstDivergence.bigDecimal, reportedPrecision) + worstRounding
+            }
+          }
         }
       }
 
@@ -330,7 +333,7 @@ trait RoundoffChecker extends VerificationChecker {
         // one that had no time to try.
         def summarise(): Unit = {
           val share = Settings.budget * Settings.pruningShare
-          val used = ((share - cake.fold(0.0)(_.left)) * 1000).toInt.max(0)
+          val used = ((share - cake.map(_.left).getOrElse(0.0)) * 1000).toInt.max(0)
           reporter.debug(
             s"Roundoff pruning of ${fd.id.asString}: $asked of " +
             s"${counted(asked + skipped, "branch question")} asked, $refuted refuted, " +
@@ -373,14 +376,15 @@ trait RoundoffChecker extends VerificationChecker {
             def assuming[B](condition: Expr)(block: => B): Option[B] = {
               // The share left over the questions left. Over-estimating how many are left only
               // makes the shares smaller, so the phase keeps to its part of the budget either way.
-              val allowance = cake.fold(Settings.budget * Settings.pruningShare)(_.slice())
+              val allowance = cake.map(_.slice()).getOrElse(Settings.budget * Settings.pruningShare)
 
               if (refusedFloats || allowance < minQueryTimeout) { skipped += 1; Some(block) }
               else {
                 cake.foreach(_.taken())
                 asked += 1
                 val questioned = solver
-                questioned.setTimeout(ambient.fold(allowance.seconds)(_.min(allowance.seconds)))
+                questioned.setTimeout(
+                  ambient.map(_.min(allowance.seconds)).getOrElse(allowance.seconds))
                 questioned.push()
                 try {
                   questioned.assertCnstr(condition)
@@ -475,22 +479,29 @@ trait RoundoffChecker extends VerificationChecker {
     private def subjectOf(fd: FunDef, written: Seq[String]): Either[String, (FuzzSubject, String)] = {
       val name = fd.id.name
 
-      for {
-        _ <- Either.cond(!written.contains(name), (),
-               s"another annotated function is called '$name', and a witness names only " +
-               "the function it belongs to, so the two cannot be told apart")
-        _ <- Either.cond(!AccessPath.isCompound(fd.returnType), (),
-               "the fuzzer returns one double, and this function's result holds several " +
-               "numbers; the analysis answers about each of them but the fuzzer is not " +
-               "asked about any")
-        parts <- decompositions.of(fd.id, None)
-        values = parts.flattening.parameters
-        domain <- traverse(values)(p => parts.spec.ranges.get(p.id).toRight(
-                    s"no range in the precondition for '${p.id.name}'"))
-        source <- FuzzProgramEmitter.emit(fd, name, parts.spec, parts.body, values,
-                    FPCoreEmitter.assumptions(fd, parts.flattening))(using program.symbols)
-      } yield (FuzzSubject(name, values.map(_.id.name), domain), source)
+      if (written.contains(name))
+        Left(s"another annotated function is called '$name', and a witness names only " +
+             "the function it belongs to, so the two cannot be told apart")
+      else if (AccessPath.isCompound(fd.returnType))
+        Left("the fuzzer returns one double, and this function's result holds several " +
+             "numbers; the analysis answers about each of them but the fuzzer is not " +
+             "asked about any")
+      else
+        decompositions.of(fd.id, None).flatMap { parts =>
+          val values = parts.flattening.parameters
+
+          domainOf(parts).flatMap { domain =>
+            FuzzProgramEmitter.emit(fd, name, parts.spec, parts.body, values,
+              FPCoreEmitter.assumptions(fd, parts.flattening))(using program.symbols)
+              .map(source => (FuzzSubject(name, values.map(_.id.name), domain), source))
+          }
+        }
     }
+
+    /** What the precondition says each input lies between, in the order they are declared. */
+    private def domainOf(parts: RoundoffErrorDecomposition): Either[String, Seq[(Double, Double)]] =
+      traverse(parts.flattening.parameters)(p => parts.spec.ranges.get(p.id).toRight(
+        s"no range in the precondition for '${p.id.name}'"))
 
     /** Runs the fuzzer over all functions. */
     def run(): Unit = { val _ = fuzzerResult }
@@ -517,8 +528,11 @@ trait RoundoffChecker extends VerificationChecker {
       if (!fuzzer.enabled || subjects.isEmpty) Left("the fuzzer was not run")
       else
         scala.util.Try(
-          phases.fuzzing.run(fuzzer.run(writeSubjects(Settings.witnessFile.getOrElse(scratch)))))
-          .fold(e => Left(s"the fuzzer could not be run: ${e.getMessage}"), identity)
+          phases.fuzzing.run(fuzzer.run(writeSubjects(Settings.witnessFile.getOrElse(scratch))))
+        ) match {
+          case scala.util.Success(errors) => errors
+          case scala.util.Failure(e) => Left(s"the fuzzer could not be run: ${e.getMessage}")
+        }
 
     /** Writes the program and the configuration. */
     private def writeSubjects(base: java.io.File): java.io.File = {
