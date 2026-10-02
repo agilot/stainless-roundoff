@@ -15,6 +15,8 @@ class DaisyRunner(ctx: inox.Context) extends RoundingAnalyzer {
 
   val name = "daisy"
 
+  val emitter = FPCoreEmitter
+
   private val configured = ctx.options.findOptionOrDefault(optDaisy)
 
   /** The executable, either as given or found on `PATH`. */
@@ -59,7 +61,7 @@ class DaisyRunner(ctx: inox.Context) extends RoundingAnalyzer {
       // Daisy writes into output/ without creating it, and appends if the file is
       // already there, so each run gets a fresh name in a directory we make ourselves.
       outputDir.mkdirs()
-      Files.write(source.toPath, batch.map(_.fpcoreSource).mkString("\n").getBytes("UTF-8"))
+      Files.write(source.toPath, batch.map(_.source).mkString("\n").getBytes("UTF-8"))
 
       val cmd = List(
         exe.getAbsolutePath,

@@ -27,6 +27,82 @@ package object roundoff {
     val usageRhs = "PATH"
   }
 
+  /** Which tool bounds the rounding error of a leaf.
+    *
+    * The two answer the same question — an input holds an exact real and is rounded on entry —
+    * and differ in how tightly they bound it, so a figure from one is a check on the other
+    * rather than a different measurement.
+    */
+  enum AnalyzerChoice {
+    case Daisy
+    case FPTaylor
+  }
+
+  object AnalyzerChoice {
+    def tryFromString(s: String): Option[AnalyzerChoice] = s.toLowerCase match {
+      case "daisy" => Some(Daisy)
+      case "fptaylor" => Some(FPTaylor)
+      case _ => None
+    }
+  }
+
+  object optRoundoffAnalyzer extends inox.OptionDef[AnalyzerChoice] {
+    val name = "roundoff-analyzer"
+    val default = AnalyzerChoice.Daisy
+    val parser = AnalyzerChoice.tryFromString
+    val usageRhs = "daisy|fptaylor"
+  }
+
+  /** Path to the FPTaylor executable */
+  object optFPTaylor extends inox.OptionDef[String] {
+    import inox.OptionParsers._
+    val name = "fptaylor"
+    val default = "fptaylor"
+    val parser = stringParser
+    val usageRhs = "PATH"
+  }
+
+  /** Seconds the whole batch of FPTaylor queries may take together.
+    *
+    * FPTaylor has a budget per optimization problem of its own, but none for a run, and a leaf
+    * whose form is hard raises many problems, so the run is what has to be bounded from here.
+    */
+  object optFPTaylorTimeout extends inox.OptionDef[Double] {
+    import inox.OptionParsers._
+    val name = "fptaylor-timeout"
+    val default = 300.0
+    val parser = doubleParser
+    val usageRhs = "SECONDS"
+  }
+
+  /** Which of FPTaylor's optimizers bounds a Taylor form.
+    *
+    * The two are worth knowing about because neither wins everywhere. `bb` compiles every
+    * objective with `ocamlopt` before searching it, so it pays a process and a native compile
+    * per problem; on forty leaves of three operations each that cost 36.4s against 0.3s for the
+    * interpreted `bb-eval`, for bounds identical to the digit. But `bb-eval` does not scale to
+    * the leaves the benchmarks actually produce: `Algebird` and `OrientationIndexFilter` both
+    * run past a five-minute batch and return nothing at all under it, where `auto` answers them
+    * in 56s and 90s. So the default is FPTaylor's own size-aware choice, and `bb-eval` is worth
+    * reaching for only where every leaf is known to be small.
+    */
+  object optFPTaylorOptimizer extends inox.OptionDef[String] {
+    import inox.OptionParsers._
+    val name = "fptaylor-optimizer"
+    val default = "auto"
+    val parser = stringParser
+    val usageRhs = "auto|bb|bb-eval"
+  }
+
+  /** Milliseconds FPTaylor may spend on any one of its optimization problems. */
+  object optFPTaylorOptTimeout extends inox.OptionDef[Int] {
+    import inox.OptionParsers._
+    val name = "fptaylor-opt-timeout"
+    val default = 10000
+    val parser = intParser
+    val usageRhs = "MILLISECONDS"
+  }
+
   /** Path to the fuzzer, empty for not fuzzing at all.
     *
     * The analysis bounds an error from above; the fuzzer looks for one from below, in the
@@ -361,9 +437,10 @@ package object roundoff {
     }
   }
 
-  enum FPPrecision(val exponent: Int, val significand: Int, val daisyName: String) {
-    case Binary32 extends FPPrecision(8, 24, "Float32")
-    case Binary64 extends FPPrecision(11, 53, "Float64")
+  enum FPPrecision(val exponent: Int, val significand: Int,
+                   val daisyName: String, val fptaylorRounding: String) {
+    case Binary32 extends FPPrecision(8, 24, "Float32", "rnd32")
+    case Binary64 extends FPPrecision(11, 53, "Float64", "rnd64")
   }
 
   object FPPrecision {
@@ -377,14 +454,27 @@ package object roundoff {
   /** The precision a function runs at, and the range its precondition gives each input. */
   case class InputSpec(precision: FPPrecision, ranges: Map[Identifier, (Double, Double)])
 
-  /** One straight-line expression to analyze, as a self-contained FPCore definition. */
-  case class RoundingQuery(fid: Identifier, name: String, precision: FPPrecision, fpcoreSource: String)
+  /** One straight-line expression to analyze, written in the analyzer's own input language. */
+  case class RoundingQuery(fid: Identifier, name: String, precision: FPPrecision, source: String)
 
   case class RoundingResult(absError: BigDecimal)
+
+  /** How one analyzer writes a straight-line expression in its own input language.
+    *
+    * A refusal here is what keeps a leaf the tool cannot express from being paid for: it is
+    * raised while the function is being decomposed, before any branch is searched.
+    */
+  trait RoundingSourceEmitter {
+    def emit(name: String, label: String, expr: Expr, spec: InputSpec)(using Symbols)
+      : Either[String, String]
+  }
 
   /** A tool that bounds errors introduced by floating-point rounding along one straight-line expression. */
   trait RoundingAnalyzer {
     val name: String
+
+    /** Writes a query the way this tool reads it */
+    val emitter: RoundingSourceEmitter
 
     /** Answers every query in one batch */
     def analyze(queries: Seq[RoundingQuery]): Map[String, Either[String, RoundingResult]]

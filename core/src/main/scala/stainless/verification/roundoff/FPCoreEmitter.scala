@@ -69,12 +69,23 @@ private[roundoff] object Fraction {
     }
 }
 
-/** Writes a floating-point expression as an FPCore definition. */
-object FPCoreEmitter {
+/** The name an input goes by in an analyzer's input language, unique across the program. */
+private[roundoff] def symbol(id: Identifier): String = s"v_${id.globalId}"
 
+/** Writes a floating-point expression as an FPCore definition. */
+object FPCoreEmitter extends RoundingSourceEmitter {
+
+  /** What the precondition says an input lies between.
+    *
+    * Bounds on the same side of the same input are intersected, since they are read out of a
+    * conjunction and a run satisfies all of them: `x <= 2 && x <= 1` leaves `x` at or below
+    * one. Widening instead would still be sound, because a wider box holds every input the
+    * narrower one does, but it loses the tighter conjunct entirely, and a precondition often
+    * states the range it means twice — once loosely and once as the constraint that matters.
+    */
   private case class Bounds(low: Option[Double], high: Option[Double]) {
-    def withLow(d: Double) = Bounds(Some(low.map(math.min(_, d)).getOrElse(d)), high)
-    def withHigh(d: Double) = Bounds(low, Some(high.map(math.max(_, d)).getOrElse(d)))
+    def withLow(d: Double) = Bounds(Some(low.map(math.max(_, d)).getOrElse(d)), high)
+    def withHigh(d: Double) = Bounds(low, Some(high.map(math.min(_, d)).getOrElse(d)))
   }
 
   private object Bounds { val empty = Bounds(None, None) }
@@ -84,8 +95,13 @@ object FPCoreEmitter {
     : Either[String, InputSpec] =
     uniformPrecision(body).map { precision =>
       val bounds = extractRanges(assumptions(fd, flattening))
-      // A half-open range is no more usable than a missing one
-      val ranges = bounds.collect { case (id, Bounds(Some(low), Some(high))) => id -> (low, high) }
+      // A half-open range is no more usable than a missing one, and neither is an empty one,
+      // which is what intersecting the bounds of a contradictory precondition leaves. Dropping
+      // it reports the input as unranged rather than asking the analyzer about a box no run
+      // is in; that the precondition cannot be met is the reachability check's to say.
+      val ranges = bounds.collect {
+        case (id, Bounds(Some(low), Some(high))) if low <= high => id -> (low, high)
+      }
       InputSpec(precision, ranges)
     }
 
@@ -271,8 +287,6 @@ object FPCoreEmitter {
     }
   }
 
-
-  private def symbol(id: Identifier): String = s"v_${id.globalId}"
 
   private def roundingModeName(e: Expr): String = e match {
     case RoundTowardZero => "toward zero"

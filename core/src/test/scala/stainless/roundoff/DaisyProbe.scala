@@ -75,7 +75,7 @@ object DaisyProbe {
       built match {
         case Right(q) =>
           println(s"[emit ok]   ${fd.id.name} -> ${q.name} (${q.precision})")
-          println(q.fpcoreSource.linesIterator.map("    " + _).mkString("\n"))
+          println(q.source.linesIterator.map("    " + _).mkString("\n"))
           Some(q)
         case Left(why) =>
           println(s"[emit skip] ${fd.id.name}: $why")

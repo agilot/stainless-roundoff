@@ -114,7 +114,10 @@ trait RoundoffChecker extends VerificationChecker {
           "is not the one that was analyzed")
   }
 
-  private lazy val analyzer: RoundingAnalyzer = new DaisyRunner(context)
+  private lazy val analyzer: RoundingAnalyzer = Settings.analyzer match {
+    case AnalyzerChoice.Daisy => new DaisyRunner(context)
+    case AnalyzerChoice.FPTaylor => new FPTaylorRunner(context)
+  }
 
   private lazy val fuzzer = new FuzzRunner(context)
 
@@ -295,7 +298,8 @@ trait RoundoffChecker extends VerificationChecker {
         val start = System.nanoTime()
         val outcome = oracle.around(fd) { branches =>
           RoundoffErrorDecomposition.of(fd, Settings.exactInputs, Settings.mode, branches, phases,
-                                Settings.normalise, Settings.pathRanges)(using program.symbols)
+                                Settings.normalise, Settings.pathRanges,
+                                analyzer.emitter)(using program.symbols)
         }
         fd.id -> ((System.nanoTime() - start) / 1000000, outcome)
       }.toMap
@@ -587,6 +591,9 @@ trait RoundoffChecker extends VerificationChecker {
 
     lazy val mode: DiscontinuityMode =
       context.options.findOptionOrDefault(optRoundoffDiscontinuity)
+
+    lazy val analyzer: AnalyzerChoice =
+      context.options.findOptionOrDefault(optRoundoffAnalyzer)
 
     /** How long one function may be read and searched for, all phases together. */
     lazy val budget: Double = context.options.findOptionOrDefault(optRoundoffTimeout)

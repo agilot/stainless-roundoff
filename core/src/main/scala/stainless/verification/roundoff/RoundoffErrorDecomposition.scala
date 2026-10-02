@@ -8,18 +8,13 @@ import trees._
 
 import scala.collection.mutable.ArrayBuffer
 
-/** A comparison a conditional branches on, oriented so that taking it puts `lhs` below `rhs`. */
+/** A comparison a conditional branches on. */
 case class Guard(lhs: Expr, rhs: Expr, strict: Boolean)
 
 /** Which side of one guard a path took. */
 case class BranchChoice(guard: Int, taken: Boolean)
 
-/** One straight-line path: what it chose at each guard, and the expression it ends in.
-  *
-  * `reachable` is false where no input reaches the leaf in floating point. Such a leaf is
-  * never rounded by a run and is never the path a run takes instead of the exact one, but it
-  * stays a path the exact run can take, so it is recorded rather than dropped.
-  */
+/** A straight-line branch in the execution tree */
 case class ProgramPath(choices: Seq[BranchChoice], leaf: Expr, reachable: Boolean = true)
 
 /** Splits a function body into the straight-line paths through it. */
@@ -585,9 +580,10 @@ object RoundoffErrorDecomposition {
          oracle: BranchOracle = BranchOracle.open,
          timers: inox.utils.TimerStorage = inox.utils.TimerStorage(),
          normalise: Boolean = true,
-         pathRanges: Boolean = true)(using Symbols)
+         pathRanges: Boolean = true,
+         emitter: RoundingSourceEmitter = FPCoreEmitter)(using Symbols)
     : Either[String, Seq[(AccessPath, RoundoffErrorDecomposition)]] = {
-    val options = DecompositionOptions(exactInputs, mode, normalise, pathRanges, timers)
+    val options = DecompositionOptions(exactInputs, mode, normalise, pathRanges, timers, emitter)
 
     read(fd, oracle, options).flatMap(reading => traverse(reading.fields)(reading.decompose(_)))
   }
@@ -595,7 +591,8 @@ object RoundoffErrorDecomposition {
   /** What the caller asked for, carried unchanged through the reading of one function. */
   private case class DecompositionOptions(exactInputs: Boolean, mode: DiscontinuityMode,
                                           normalise: Boolean, pathRanges: Boolean,
-                                          timers: inox.utils.TimerStorage)
+                                          timers: inox.utils.TimerStorage,
+                                          emitter: RoundingSourceEmitter)
 
   /** What one function's body came to, before its result is read one number at a time.
     *
@@ -652,9 +649,9 @@ object RoundoffErrorDecomposition {
       val k = guardNames(guard)
 
       errorOf(fd, s"${prefix(fd)}_guard${k}_lhs", s"${fd.id.name} (guard ${k + 1}, left)",
-              guard.lhs, spec, options.exactInputs).flatMap { lhs =>
+              guard.lhs, spec, options).flatMap { lhs =>
         errorOf(fd, s"${prefix(fd)}_guard${k}_rhs", s"${fd.id.name} (guard ${k + 1}, right)",
-                guard.rhs, spec, options.exactInputs).map((lhs, _))
+                guard.rhs, spec, options).map((lhs, _))
       }
     })
   }
@@ -688,7 +685,7 @@ object RoundoffErrorDecomposition {
         else {
           val k = leafNames(leafKeys(i))
           errorOf(fd, s"${tag}_leaf$k", s"$named (leaf ${k + 1})",
-                  narrowed(i).leaf, leafSpecs(i), options.exactInputs)
+                  narrowed(i).leaf, leafSpecs(i), options)
         }
       })
 
@@ -715,11 +712,12 @@ object RoundoffErrorDecomposition {
   }
 
   private def errorOf(fd: FunDef, name: String, label: String, expr: Expr, spec: InputSpec,
-                      exactInputs: Boolean)(using Symbols): Either[String, RoundingError] =
-    if (isExact(expr, exactInputs)) Right(RoundingError.Exact)
+                      options: DecompositionOptions)(using Symbols)
+    : Either[String, RoundingError] =
+    if (isExact(expr, options.exactInputs)) Right(RoundingError.Exact)
     else if (exprOps.variablesOf(expr).isEmpty)
       ConstantEvaluator.error(expr, spec.precision).map(RoundingError.Computed(_))
-    else FPCoreEmitter.emit(name, label, expr, spec)
+    else options.emitter.emit(name, label, expr, spec)
            .map(source => RoundingError.FromAnalyzer(
              RoundingQuery(fd.id, name, spec.precision, source)))
 
