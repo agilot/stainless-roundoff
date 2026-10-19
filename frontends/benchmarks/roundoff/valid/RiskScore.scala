@@ -2,10 +2,7 @@ import stainless.annotation.*
 
 object RiskScore {
 
-  /** A balanced tree of three nestings, so eight leaves sit under the outermost guard.
-    * This is the shape where `--roundoff-discontinuity=reference` sends far fewer queries
-    * than the pairwise default, and where the two answers part company.
-    */
+  /** A balanced tree of three nestings, so eight leaves sit under the outermost guard. */
   @roundoff
   def score(income: Double, debt: Double, history: Double, age: Double): Double = {
     require(1.0 <= income && income <= 20.0)

@@ -43,13 +43,13 @@ class FlatteningSuite extends AnyFunSuite with Unwrapping {
   private val s = Variable.fresh("s", sensorType)
 
   private def flatten(body: Expr, params: Seq[ValDef] = Seq(s.toVal))
-    : Either[String, (Expr, ADTParametersFlattening)] = {
+    : Either[String, (Expr, ParameterFlattening)] = {
     val fd = new FunDef(FreshIdentifier("f"), Seq.empty, params, f64, body, Seq.empty)
     given Symbols = NoSymbols.withSorts(sorts).withFunctions(Seq(fd))
-    ADTParametersFlattening.flatten(fd, body)
+    ParameterFlattening.flatten(fd, body)
   }
 
-  private def value(body: Expr): (Expr, ADTParametersFlattening) =
+  private def value(body: Expr): (Expr, ParameterFlattening) =
     flatten(body).orFail
 
   test("a field of a parameter becomes a value of its own") {

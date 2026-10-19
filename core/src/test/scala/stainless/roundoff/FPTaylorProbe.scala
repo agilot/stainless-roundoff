@@ -78,9 +78,9 @@ object FPTaylorProbe {
         read <- Preprocessor(fd)
         (whole, fields, flattening) = read
         body = fields.head.project(whole)
-        spec <- FPCoreEmitter.specOf(fd, body, flattening)
+        spec <- InputRanges.specOf(fd, body, flattening)
         source <- FPTaylorEmitter.emit(fd.id.name, fd.id.name, body, spec)
-      } yield RoundingQuery(fd.id, fd.id.name, spec.precision, source)
+      } yield RoundingQuery(fd.id.name, spec.precision, source)
 
       built match {
         case Right(q) =>
@@ -96,11 +96,11 @@ object FPTaylorProbe {
     println("=" * 70)
     val ctx = inox.Context.empty.withOpts(
       optFPTaylor(args.headOption.getOrElse("fptaylor")))
-    val runner = new FPTaylorRunner(ctx)
+    val runner = new FPTaylorRunner(ctx, RoundoffSettings.from(ctx))
 
     for ((name, res) <- runner.analyze(queries).toSeq.sortBy(_._1)) {
       res match {
-        case Right(res) => println(s"[result]  $name: error <= ${res.absError}")
+        case Right(res) => println(s"[result]  $name: error <= $res")
         case Left(why) => println(s"[no result] $name: $why")
       }
     }

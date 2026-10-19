@@ -58,7 +58,6 @@ trait MainHelpers extends inox.MainHelpers { self =>
     verification.roundoff.optRoundoffWitnesses -> Description(Verification, "Write what each branch-divergence query established, as JSON, to this file, and beside it the program and configuration the fuzzer reads for every @fuzz function"),
     verification.roundoff.optFuzz -> Description(Verification, "Path to the fuzzer used to find a lower bound on a @roundoff error, empty for not fuzzing at all"),
     verification.roundoff.optRoundoffExactInputs -> Description(Verification, "Treat @roundoff inputs as exact reals rather than values already rounded on entry"),
-    verification.roundoff.optRoundoffDiscontinuity -> Description(Verification, "Bound a @roundoff discontinuity one side of a guard at a time (pairwise), both sides at once (merged), or against one reference leaf (reference)"),
     verification.roundoff.optRoundoffPruning -> Description(Verification, "Ask whether any input reaches a branch before enumerating it, so that a path no run takes neither costs a query nor counts towards the error"),
     verification.roundoff.optRoundoffIncumbent -> Description(Verification, "Set aside a branch-divergence query that cannot reach as far as one already answered, since the error of a function is the widest of its divergences"),
     verification.roundoff.optRoundoffPathRanges -> Description(Verification, "Bound a leaf over the inputs that reach it, narrowing its ranges by every guard above it that compares an input against a literal"),

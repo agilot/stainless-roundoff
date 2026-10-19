@@ -71,6 +71,22 @@ class ReachabilitySuite extends AnyFunSuite with Unwrapping {
     assert(stub.asked.size == 2)
   }
 
+  test("two unreachable leaves are not compared, but an unreachable and a reachable one are") {
+    // `if (a < b) 1.0 else { if (b < c) 2.0 else 3.0 }`, with the else branch refuted.
+    val body = IfExpr(FPLessThan(a, b), one, IfExpr(FPLessThan(b, c), two, three))
+    val (guards, paths) = extract(body, new Stub(refuse = _ == Not(FPLessThan(a, b))))
+    val spec = InputSpec(FPPrecision.Binary64,
+                         Seq(a, b, c).map(v => v.id -> (0.0, 1.0)).toMap)
+
+    val (_, regions) = GuardRegions.encode(guards, paths, spec, normalise = false).orFail
+    val pairsPerGuard = regions.map(r => r.guard -> r.pairs.map(p => (p.taken, p.untaken))).toMap
+
+    // The exact run can still take the refuted branch, so 1.0 is compared with both its leaves.
+    assert(pairsPerGuard(0) == Seq((0, 1), (0, 2)))
+    // The rounded program reaches neither 2.0 nor 3.0.
+    assert(pairsPerGuard(1).isEmpty)
+  }
+
   test("refusing nothing leaves every path the body spells out") {
     val (guards, paths) = extract(nested, BranchOracle.open)
 
@@ -157,7 +173,7 @@ class ReachabilitySuite extends AnyFunSuite with Unwrapping {
   private val below = Guard(a, two, strict = true)
 
   private def narrow(guard: Guard, taken: Boolean): (Double, Double) =
-    FPCoreEmitter.narrowed(spec, Seq(guard), Seq(BranchChoice(0, taken))).ranges(a.id)
+    InputRanges.narrowed(spec, Seq(guard), Seq(BranchChoice(0, taken))).ranges(a.id)
 
   test("taking a guard against a literal caps the input at it") {
     assert(narrow(below, taken = true) == (0.0, 2.0))
@@ -175,12 +191,12 @@ class ReachabilitySuite extends AnyFunSuite with Unwrapping {
 
   test("a guard between two inputs narrows nothing, since neither side is a literal") {
     val between = Guard(a, b, strict = true)
-    assert(FPCoreEmitter.narrowed(spec, Seq(between), Seq(BranchChoice(0, true))).ranges == spec.ranges)
+    assert(InputRanges.narrowed(spec, Seq(between), Seq(BranchChoice(0, true))).ranges == spec.ranges)
   }
 
   test("a guard on a computed value says nothing about the inputs under it") {
     val computed = Guard(FPMul(RoundNearestTiesToEven, a, a), two, strict = true)
-    assert(FPCoreEmitter.narrowed(spec, Seq(computed), Seq(BranchChoice(0, true))).ranges == spec.ranges)
+    assert(InputRanges.narrowed(spec, Seq(computed), Seq(BranchChoice(0, true))).ranges == spec.ranges)
   }
 
   test("a guard the box already decides leaves the range as it was") {
@@ -196,7 +212,7 @@ class ReachabilitySuite extends AnyFunSuite with Unwrapping {
   test("nested guards narrow from both sides") {
     val lower = Guard(Float64Literal(10.0), a, strict = true)
     val upper = Guard(a, Float64Literal(40.0), strict = true)
-    val both = FPCoreEmitter.narrowed(spec, Seq(lower, upper),
+    val both = InputRanges.narrowed(spec, Seq(lower, upper),
                                       Seq(BranchChoice(0, true), BranchChoice(1, true)))
     assert(both.ranges(a.id) == (10.0, 40.0))
   }

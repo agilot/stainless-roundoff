@@ -106,9 +106,10 @@ class FuzzEmitterSuite extends AnyFunSuite with Unwrapping {
 
   private val subject = FuzzSubject("denoise", Seq("a", "b"), Seq((0.1, 10.0), (0.5, 2.0)))
 
+  private val site = LeafPairSite("denoise", guard = 0, taken = 1, untaken = 2)
+
   private def witness(box: Box): Witness =
-    Witness.bounded(Site("denoise", 0), other = 2, maximizing = true, box = box,
-                    against = Some(1), scheme = DiscontinuityMode.Merged)
+    Witness(site, DivergenceStatus.Bounded, maximizing = Some(true), box = Some(box))
 
   test("a configuration names its intervals by position, and the domain comes from the ranges") {
     val box: Box = Map("a" -> (Some(BigDecimal(1)), Some(BigDecimal(2))),
@@ -128,8 +129,7 @@ class FuzzEmitterSuite extends AnyFunSuite with Unwrapping {
   }
 
   test("a divergence with no box of its own is not made into a configuration") {
-    val refused = Witness.infeasible(Site("denoise", 0), other = 2, against = Some(1),
-                                     scheme = DiscontinuityMode.Merged)
+    val refused = Witness(site, DivergenceStatus.Infeasible)
     val conf = FuzzConfEmitter.emit(Seq(subject -> Seq(refused)))
     assert(!conf.contains("divergence"))
     assert(conf.contains("denoise.rounding.domain"))
@@ -141,7 +141,7 @@ class FuzzEmitterSuite extends AnyFunSuite with Unwrapping {
   */
 class FuzzRunnerSuite extends AnyFunSuite {
 
-  private val runner = new FuzzRunner(inox.Context.empty)
+  private val runner = new FuzzRunner(inox.Context.empty, RoundoffSettings.from(inox.Context.empty))
 
   private val output =
     """|Compiling /tmp/witness.scala...
