@@ -77,8 +77,8 @@ object FPTaylorProbe {
       val built = for {
         read <- Preprocessor(fd)
         (whole, fields, flattening) = read
-        body = fields.head.project(whole)
-        spec <- InputRanges.specOf(fd, body, flattening)
+        body = fields.head.extractFrom(whole)
+        spec <- InputRanges.inputSpecOf(fd, body, flattening)
         source <- FPTaylorEmitter.emit(fd.id.name, fd.id.name, body, spec)
       } yield RoundingQuery(fd.id.name, spec.precision, source)
 
@@ -98,7 +98,7 @@ object FPTaylorProbe {
       optFPTaylor(args.headOption.getOrElse("fptaylor")))
     val runner = new FPTaylorRunner(ctx, RoundoffSettings.from(ctx))
 
-    for ((name, res) <- runner.analyze(queries).toSeq.sortBy(_._1)) {
+    for ((name, res) <- runner.analyze(queries, seconds = 300.0).toSeq.sortBy(_._1)) {
       res match {
         case Right(res) => println(s"[result]  $name: error <= $res")
         case Left(why) => println(s"[no result] $name: $why")

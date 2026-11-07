@@ -104,9 +104,16 @@ trait SymbolOps extends inox.ast.SymbolOps with TypeOps { self =>
         bind(ob, in) `withCond` Not(up.isEmpty(in)) `merge` subs
 
       case LiteralPattern(ob, lit) =>
-        pp.empty `withCond` Equals(in, lit) `merge` bind(ob, in)
+        pp.empty `withCond` literalPatternTest(in, lit) `merge` bind(ob, in)
     }
   }
+
+  /** Whether `in` matches the literal pattern `lit`. Scala tests it with `==`, which for a
+    * floating-point number is not `Equals`: `case 0.0` also matches `-0.0`, and `NaN` matches
+    * nothing.
+    */
+  def literalPatternTest(in: Expr, lit: Literal[?]): Expr =
+    if (lit.getType.isInstanceOf[FPType]) FPEquals(in, lit) else Equals(in, lit)
 
   /* Override point for extracting pattern conditions. */
   protected def patternConditions[P <: PathLike[P]](includeBinders: Boolean)(using PathProvider[P]) =

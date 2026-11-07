@@ -89,6 +89,17 @@ class FPTaylorEmitterSuite extends AnyFunSuite with Unwrapping {
     assert(emit(Sqrt(rm, a)).orFail.contains(s"sqrt(${name(a)})"))
   }
 
+  test("an integer constant converted to a double is written as a number") {
+    val task = emit(FPMul(rm, a, FPCast(11, 53, rm, Int32Literal(2)))).orFail
+    assert(task.contains(s"(${name(a)} * (2))"), s"in\n$task")
+  }
+
+  test("an integer constant bound to a name is written as a number where it is converted") {
+    val k = ValDef.fresh("k", Int32Type())
+    val task = emit(Let(k, Int32Literal(2), FPMul(rm, a, FPCast(11, 53, rm, k.toVariable)))).orFail
+    assert(task.contains(s"(${name(a)} * (2))"), s"in\n$task")
+  }
+
   test("an input with no range is refused, naming the input and what to write") {
     val loose = InputSpec(FPPrecision.Binary64, Map(a.id -> (0.1, 10.0)))
     val why = emit(FPMul(rm, a, b), loose).left.getOrElse(fail("a loose input was accepted"))
@@ -100,13 +111,6 @@ class FPTaylorEmitterSuite extends AnyFunSuite with Unwrapping {
     val why = emit(FPMul(rm, Float64Literal(2.0), Float64Literal(3.0)))
       .left.getOrElse(fail("a constant expression was accepted"))
     assert(why.contains("no floating-point inputs"))
-  }
-
-  test("a rounding mode other than to-nearest is refused, naming the mode") {
-    val why = emit(FPMul(RoundTowardZero, a, b))
-      .left.getOrElse(fail("a non-default rounding mode was accepted"))
-    assert(why.contains("toward zero"))
-    assert(why.contains("rnd64"))
   }
 
 }

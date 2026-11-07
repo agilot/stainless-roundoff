@@ -74,12 +74,14 @@ object VCKind {
   case class  Error(err: String)            extends VCKind(s"error: $err", "error")
   case class  AdtInvariant(inv: Identifier) extends VCKind(s"class invariant: ${inv.name}", "class inv.")
   case object SATPrecondCheck               extends VCKind("precondition satisfiability", "sat precond.")
-  /** @param field which number of the result this is about, where the result holds several */
   case class RoundoffError(bound: Option[BigDecimal], field: Option[String])
     extends VCKind(
       (Seq("roundoff error") ++ field.map(f => s"($f)") ++ bound.map(b => s"<= $b")).mkString(" "),
-      field.fold("roundoff")(f => s"roundoff $f"))
-  case object RoundoffFinite                extends VCKind("roundoff finiteness", "roundoff fin.")
+      if field.isEmpty then "roundoff" else s"roundoff ${field.get}")
+  case class RoundoffFinite(field: Option[String])
+    extends VCKind((Seq("roundoff finiteness") ++ field.map(f => s"($f)")).mkString(" "),
+      if field.isEmpty then "roundoff" else s"roundoff ${field.get}")
+  case object RoundoffCases                 extends VCKind("roundoff case agreement", "roundoff cases")
 
   def fromErr(optErr: Option[String]) = {
     optErr.map { err =>

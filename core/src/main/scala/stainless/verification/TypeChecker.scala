@@ -1495,14 +1495,22 @@ class TypeChecker(val program: StainlessProgram, val context: inox.Context, val 
           // several errors. A result that is one number gives one, unlabelled, as before.
           // Read off the declared type: freshening renames what a body binds, and the names
           // of a result's fields belong to its type rather than to this function.
-          val fields = roundoff.AccessPath.list(fd.returnType)
+          val fields = roundoff.FieldPath.numberPathsOf(fd.returnType)
+          val hasCases = roundoff.FieldPath.hasConstructorChoice(fd.returnType)
           val labels =
-            if (fields.size <= 1) Seq(None) else fields.map(path => Some(path.displayName))
+            if (fields.size <= 1 && !hasCases) Seq(None)
+            else fields.map(path => Some(path.displayName))
+          // A result with a choice of constructors is not held to the bound yet: which case
+          // the bound is about is still to be decided.
+          val checked = if (hasCases) None else bound
 
-          labels.foldLeft(TyperResult.valid) { (built, field) =>
-            built ++ buildVC(tcWithPre.withVCKind(VCKind.RoundoffError(bound, field)),
+          val errors = labels.foldLeft(TyperResult.valid) { (built, field) =>
+            built ++ buildVC(tcWithPre.withVCKind(VCKind.RoundoffError(checked, field)),
                              BooleanLiteral(false))
           }
+          // And whether the two runs can end in different constructors at all.
+          if (!hasCases) errors
+          else errors ++ buildVC(tcWithPre.withVCKind(VCKind.RoundoffCases), BooleanLiteral(false))
       }
 
     // We check that the specification is SAT to avoid false => P(body(x)) type of proofs
@@ -1539,18 +1547,21 @@ class TypeChecker(val program: StainlessProgram, val context: inox.Context, val 
       if (!fd.flags.exists { case Roundoff(_) => true; case _ => false }) TyperResult.valid
       else bodyOpt match {
         case Some(body) =>
-          // Every number the result holds, so a pair of doubles is asked about as a pair.
-          roundoff.AccessPath.list(freshenedReturnType) match {
-            case Seq() => TyperResult.valid
-            case fields =>
-              val res = ValDef.fresh("res", freshenedReturnType)
-              val finite = fields.map { path =>
-                val at = path.select(res.toVariable)
-                And(Not(FPIsNaN(at)), Not(FPIsInfinite(at)))
-              }
-              buildVC(tcWithPre.withVCKind(VCKind.RoundoffFinite),
-                      Let(res, body, andJoin(finite)))
-          }
+          // One obligation per number the result holds, labelled as the error obligations
+          // are, so that each verdict says which number it is about. A number that only exists
+          // in one case is only asked about in that case, and an integer is always finite.
+          val fields = roundoff.FieldPath.numberPathsOf(freshenedReturnType)
+          val labelled = fields.size > 1 || roundoff.FieldPath.hasConstructorChoice(freshenedReturnType)
+          val res = ValDef.fresh("res", freshenedReturnType)
+          fields.filter(_.typeIn(freshenedReturnType).isInstanceOf[FPType])
+            .foldLeft(TyperResult.valid) { (built, path) =>
+              val at = path.readFrom(res.toVariable)
+              val finite = implies(andJoin(path.constructorTests(res.toVariable)),
+                                   And(Not(FPIsNaN(at)), Not(FPIsInfinite(at))))
+              val field = Option.when(labelled)(path.displayName)
+              built ++ buildVC(tcWithPre.withVCKind(VCKind.RoundoffFinite(field)),
+                               Let(res, body, finite))
+            }
         case None => TyperResult.valid
       }
 

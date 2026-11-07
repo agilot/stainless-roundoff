@@ -171,8 +171,8 @@ abstract class RecursiveEvaluator(override val program: Program,
           case other => throw EvalError(typeErrorMsg(other, BooleanType()))
         }
 
-      case (LiteralPattern(ob, lit), e) if lit == e =>
-        Some(obind(ob, e))
+      case (LiteralPattern(ob, lit), scrut) if e(literalPatternTest(scrut, lit)) == BooleanLiteral(true) =>
+        Some(obind(ob, scrut))
 
       case _ => None
     }

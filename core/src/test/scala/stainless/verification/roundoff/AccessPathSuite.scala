@@ -46,13 +46,23 @@ class AccessPathSuite extends AnyFunSuite {
                     new ADTConstructor(absentId, answerId, Seq())),
                 Seq())
 
-  private given Symbols = NoSymbols.withSorts(Seq(reading, span, answer))
+  /** `sealed trait Conclusion` with two case objects, which hold no number. */
+  private val conclusionId = FreshIdentifier("Conclusion")
+  private val continueId = FreshIdentifier("Continue")
+  private val finishedId = FreshIdentifier("Finished")
+  private val conclusion =
+    new ADTSort(conclusionId, Seq(),
+                Seq(new ADTConstructor(continueId, conclusionId, Seq()),
+                    new ADTConstructor(finishedId, conclusionId, Seq())),
+                Seq())
 
-  private def labels(tpe: Type): Seq[String] = AccessPath.list(tpe).map(_.displayName)
+  private given Symbols = NoSymbols.withSorts(Seq(reading, span, answer, conclusion))
+
+  private def labels(tpe: Type): Seq[String] = FieldPath.numberPathsOf(tpe).map(_.displayName)
 
   test("a result that is one number is one path, with nothing to say about it") {
-    assert(AccessPath.list(f64) == Seq(AccessPath.nil))
-    assert(AccessPath.list(f64).map(_.displayName) == Seq(""))
+    assert(FieldPath.numberPathsOf(f64) == Seq(FieldPath.empty))
+    assert(FieldPath.numberPathsOf(f64).map(_.displayName) == Seq(""))
   }
 
   test("a tuple is taken apart by position, one-based as a selector reads it") {
@@ -72,14 +82,71 @@ class AccessPathSuite extends AnyFunSuite {
              Seq("_1.near.value", "_1.far", "_2"))
   }
 
-  test("a class with more than one constructor is not taken apart") {
-    assert(AccessPath.list(ADTType(answerId, Seq())).isEmpty)
-    assert(AccessPath.errorMessage(ADTType(answerId, Seq())).contains("more than one constructor"))
+  private val answerType = ADTType(answerId, Seq())
+  private val knownValue = FieldPath(Seq(FieldStep.Constructor(knownId), FieldStep.Field(known.id)))
+
+  test("a class with several constructors gives the numbers of each, behind its constructor") {
+    assert(FieldPath.numberPathsOf(answerType) == Seq(knownValue))
+    assert(labels(answerType) == Seq("Known.known"))
+    assert(FieldPath.hasConstructorChoice(answerType))
+    assert(!FieldPath.hasConstructorChoice(ADTType(spanId, Seq())))
+  }
+
+  test("a leaf holds a number behind a constructor only when it is built with it") {
+    assert(knownValue.heldBy(ADT(knownId, Seq(), Seq(x))) == Right(true))
+    assert(knownValue.heldBy(ADT(absentId, Seq(), Seq())) == Right(false))
+    // Through the binding it was given, as a leaf closes over the values it reads.
+    val bound = ValDef.fresh("a", answerType)
+    assert(knownValue.heldBy(Let(bound, ADT(knownId, Seq(), Seq(x)), bound.toVariable)) ==
+             Right(true))
+    // A value whose constructor the body does not show cannot be placed.
+    assert(knownValue.heldBy(Variable.fresh("p", answerType)).isLeft)
+  }
+
+  test("a choice between constructors that hold no number is still a choice of case") {
+    val tpe = TupleType(Seq(ADTType(conclusionId, Seq()), f64))
+    assert(labels(tpe) == Seq("_2"))
+    assert(FieldPath.hasConstructorChoice(tpe))
+    assert(FieldPath.constructorsOf(Tuple(Seq(ADT(finishedId, Seq(), Seq()), x)), tpe) ==
+             Right(Seq(finishedId)))
+    // Constructors without a choice between them are no case.
+    assert(!FieldPath.hasConstructorChoice(TupleType(Seq(ADTType(spanId, Seq()), f64))))
+  }
+
+  test("the case of a leaf is the constructors it is built with") {
+    assert(FieldPath.constructorsOf(ADT(knownId, Seq(), Seq(x)), answerType) == Right(Seq(knownId)))
+    assert(FieldPath.constructorsOf(ADT(absentId, Seq(), Seq()), answerType) == Right(Seq(absentId)))
+    assert(FieldPath.constructorsOf(x, f64) == Right(Seq()))
+  }
+
+  test("projecting through a constructor keeps the leaves built with it, the others are zero") {
+    val body = IfExpr(FPLessThan(x, y), ADT(knownId, Seq(), Seq(x)), ADT(absentId, Seq(), Seq()))
+    assert(knownValue.extractFrom(body) == IfExpr(FPLessThan(x, y), x, Float64Literal(0.0)))
+  }
+
+  test("a number behind a constructor is reached after testing for it") {
+    val res = Variable.fresh("res", answerType)
+    assert(knownValue.constructorTests(res) == Seq(IsConstructor(res, knownId)))
+    assert(knownValue.readFrom(res) == ADTSelector(res, known.id))
+  }
+
+  test("a recursive class with several constructors is not taken apart") {
+    val chainId = FreshIdentifier("Chain")
+    val linkId = FreshIdentifier("Link")
+    val endId = FreshIdentifier("End")
+    val chain = new ADTSort(chainId, Seq(),
+      Seq(new ADTConstructor(linkId, chainId,
+                             Seq(ValDef.fresh("head", f64),
+                                 ValDef.fresh("next", ADTType(chainId, Seq())))),
+          new ADTConstructor(endId, chainId, Seq())),
+      Seq())
+    given Symbols = NoSymbols.withSorts(Seq(chain))
+    assert(FieldPath.numberPathsOf(ADTType(chainId, Seq())).isEmpty)
   }
 
   test("a result holding no number at all yields nothing") {
-    assert(AccessPath.list(BooleanType()).isEmpty)
-    assert(AccessPath.list(TupleType(Seq(BooleanType(), IntegerType()))).isEmpty)
+    assert(FieldPath.numberPathsOf(BooleanType()).isEmpty)
+    assert(FieldPath.numberPathsOf(TupleType(Seq(BooleanType(), IntegerType()))).isEmpty)
   }
 
   test("projecting reads the field off a constructor on every branch") {
@@ -88,8 +155,8 @@ class AccessPathSuite extends AnyFunSuite {
       ADT(reading.constructors.head.id, Seq(), Seq(e, BooleanLiteral(flag)))
     val body = IfExpr(FPLessThan(x, y), built(FPAdd(rm, x, y), true), built(FPMul(rm, x, y), false))
 
-    val path = AccessPath.list(ADTType(readingId, Seq())).head
-    assert(path.project(body) ==
+    val path = FieldPath.numberPathsOf(ADTType(readingId, Seq())).head
+    assert(path.extractFrom(body) ==
              IfExpr(FPLessThan(x, y), FPAdd(rm, x, y), FPMul(rm, x, y)))
   }
 
@@ -97,30 +164,30 @@ class AccessPathSuite extends AnyFunSuite {
     val held = ValDef.fresh("held", TupleType(Seq(f64, f64)))
     val body = Let(held, Tuple(Seq(FPAdd(rm, x, y), FPSub(rm, x, y))), held.toVariable)
 
-    val second = AccessPath.list(TupleType(Seq(f64, f64)))(1)
-    assert(second.project(body) == FPSub(rm, x, y))
+    val second = FieldPath.numberPathsOf(TupleType(Seq(f64, f64)))(1)
+    assert(second.extractFrom(body) == FPSub(rm, x, y))
   }
 
   test("the empty path is the body itself, untouched") {
     val body = FPAdd(rm, x, y)
-    assert(AccessPath.nil.project(body) == body)
+    assert(FieldPath.empty.extractFrom(body) == body)
   }
 
   test("a selection meeting a constructor that holds no such field is left alone") {
     // The same selection against the constructor that does hold the field, so that what
     // follows tells the guard apart from the selection never reaching a constructor at all.
     val held = ADT(knownId, Seq(), Seq(FPAdd(rm, x, y)))
-    assert(Preprocessor.resolveADTSelections(ADTSelector(held, known.id)) == FPAdd(rm, x, y))
+    assert(Preprocessor.resolveBuiltObjects(ADTSelector(held, known.id)) == FPAdd(rm, x, y))
 
     // `Absent` carries nothing, so selecting `Known`'s field meets no field to take.
     val absent = ADT(absentId, Seq(), Seq())
     val fromAbsent = ADTSelector(absent, known.id)
-    assert(Preprocessor.resolveADTSelections(fromAbsent) == fromAbsent)
+    assert(Preprocessor.resolveBuiltObjects(fromAbsent) == fromAbsent)
 
     // One side of the branch holds the field and the other does not, so neither is selected:
     // what is left has to be an expression, not a selection sitting on one branch.
     val either = IfExpr(FPLessThan(x, y), ADT(knownId, Seq(), Seq(FPAdd(rm, x, y))), absent)
     val fromEither = ADTSelector(either, known.id)
-    assert(Preprocessor.resolveADTSelections(fromEither) == fromEither)
+    assert(Preprocessor.resolveBuiltObjects(fromEither) == fromEither)
   }
 }
