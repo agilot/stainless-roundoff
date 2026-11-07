@@ -474,20 +474,20 @@ private[roundoff] final class FuzzDriver(
   }
 
   /** The widest error the fuzzer found for the number of `fd`'s result labelled `field`
-    * ([[VCKind.RoundoffError]]), if it was run on it.
+    * ([[VCKind.RoundoffError]]), or why it found none. Nothing when the fuzzer was not asked
+    * for, or `fd` is not marked `@fuzz`.
     */
-  def lowerBound(fd: FunDef, field: Option[String]): Option[BigDecimal] =
-    subjects.find(_.fd == fd).filter(_ => fuzzer.enabled).flatMap { subject =>
-      val number = fuzzerNameOfResultNumber(fd, field)
-      val obligation = (fd.id.asString +: field.toSeq).mkString(".")
-      fuzzedFunctions
-        .flatMap(_.get(subject.fuzzed.name).toRight("the fuzzer reported nothing for it"))
-        .flatMap(found => found.widestErrors.get(number).toRight(noErrorMessage(found))) match {
-        case Right(error) => Some(error)
-        case Left(why) =>
-          reporter.warning(fd.getPos, s"No fuzzed error for $obligation: $why")
-          None
-      }
+  def lowerBound(fd: FunDef, field: Option[String]): Option[Either[String, BigDecimal]] =
+    subjectsByFunction.collectFirst { case (`fd`, subject) => subject }.filter(_ => fuzzer.enabled).map {
+      case Left(why) => Left(s"no fuzzer program: $why")
+      case Right(subject) =>
+        val number = fuzzerNameOfResultNumber(fd, field)
+        val obligation = (fd.id.asString +: field.toSeq).mkString(".")
+        val found = fuzzedFunctions
+          .flatMap(_.get(subject.fuzzed.name).toRight("the fuzzer reported nothing for it"))
+          .flatMap(found => found.widestErrors.get(number).toRight(noErrorMessage(found)))
+        found.left.foreach(why => reporter.warning(fd.getPos, s"No fuzzed error for $obligation: $why"))
+        found
     }
 
   /** Why the fuzzer gave no error for a number of the result: the names it did report, when
@@ -530,16 +530,16 @@ private[roundoff] final class FuzzDriver(
   /** A `@fuzz` function, as the fuzzer is given it, and the source file it is written in. */
   private case class Subject(fd: FunDef, fuzzed: FuzzSubject, source: String)
 
-  private lazy val subjects: Seq[Subject] =
-    functions.filter(_.flags.contains(Fuzz)).foldLeft(Seq.empty[Subject]) {
-      (written, fd) =>
-        subjectOf(fd, written.map(_.fd.id.name)) match {
-          case Right(subject) => written :+ subject
-          case Left(why) =>
-            reporter.warning(fd.getPos, s"No fuzzer program for ${fd.id.asString}: $why")
-            written
-        }
+  /** Each `@fuzz` function, as the fuzzer is given it, or why it is not. */
+  private lazy val subjectsByFunction: Seq[(FunDef, Either[String, Subject])] =
+    functions.filter(_.flags.contains(Fuzz)).foldLeft(Seq.empty[(FunDef, Either[String, Subject])]) {
+      (done, fd) =>
+        val subject = subjectOf(fd, done.collect { case (_, Right(written)) => written.fd.id.name })
+        subject.left.foreach(why => reporter.warning(fd.getPos, s"No fuzzer program for ${fd.id.asString}: $why"))
+        done :+ (fd -> subject)
     }
+
+  private lazy val subjects: Seq[Subject] = subjectsByFunction.collect { case (_, Right(subject)) => subject }
 
   private def subjectOf(fd: FunDef, takenNames: Seq[String]): Either[String, Subject] =
     if (takenNames.contains(fd.id.name))

@@ -3,6 +3,7 @@
 package stainless.verification.roundoff
 
 import inox.solvers.*
+import io.circe.Json
 import stainless.verification.{DebugSectionVerification, VCKind, VCStatus, VerificationChecker}
 import stainless.{Identifier, StainlessProgram}
 
@@ -93,16 +94,27 @@ trait RoundoffChecker extends VerificationChecker {
 
     // With `--roundoff-only`, the other obligations are neither checked nor reported.
     val checked = if (settings.roundoffOnly) vcs.filter(isRoundoffObligation) else vcs
+    val witnessFile = settings.witnessFile
+      .filter(file => obligations.nonEmpty && settings.timeout.isDefined && fuzzDriver.sourcesReplacedBy(file).isEmpty)
     super.verify(checked, stopWhen)
-      .andThen { case _ => ibex.free() }(using stainless.executionContext(using context))
+      .andThen { case verified =>
+        ibex.free()
+        // Written again, now that every obligation has its result.
+        witnessFile.zip(verified.toOption).foreach { case (file, results) =>
+          scala.util.Try(writeWitnessFile(file, obligationRecords(results))).failed.foreach(e =>
+            reporter.warning(s"Could not write the results to $file: ${e.getMessage}"))
+        }
+      }(using stainless.executionContext(using context))
   }
 
+  /** Writes the witnesses, and the fuzzer's inputs beside them, before any obligation is
+    * checked: the fuzzer needs them to give its lower bounds.
+    */
   private def writeDivergenceWitnesses(file: java.io.File): Unit =
     fuzzDriver.sourcesReplacedBy(file) match {
       case Seq() =>
         scala.util.Try(roundoffTimers.witnesses.run {
-          val parameters = (name: String) => parameterNames.getOrElse(name, Seq.empty)
-          stainless.utils.JsonUtils.writeFile(file, Witness.toJson(ibex.witnesses, parameters))
+          writeWitnessFile(file, Seq.empty)
           fuzzDriver.writeFuzzerInputs(file)
         }).failed.foreach(e =>
           reporter.warning(s"Could not write the divergences to $file: ${e.getMessage}"))
@@ -110,6 +122,54 @@ trait RoundoffChecker extends VerificationChecker {
         reporter.warning(s"Did not write the divergences to $file: that would replace " +
           s"${replaced.mkString(" and ")}, which the program was read from")
     }
+
+  /** The witness file: what each obligation came to, then every witness Ibex recorded. */
+  private def writeWitnessFile(file: java.io.File, obligations: Seq[Json]): Unit = {
+    val parameters = (name: String) => parameterNames.getOrElse(name, Seq.empty)
+    stainless.utils.JsonUtils.writeFile(file, Json.obj(
+      "obligations" -> Json.arr(obligations*),
+      "witnesses" -> Witness.toJson(ibex.witnesses, parameters)))
+  }
+
+  /** What bounding each obligation found besides its status, by function, kind of obligation
+    * and number of the result, as fields of its record in the witness file.
+    */
+  private val obligationDetails =
+    scala.collection.concurrent.TrieMap.empty[(Identifier, String, Option[String]), Seq[(String, Json)]]
+
+  private def recordDetails(fid: Identifier, obligation: String, field: Option[String],
+                            details: (String, Option[Json])*): Unit =
+    obligationDetails.update((fid, obligation, field), details.collect { case (key, Some(value)) => key -> value })
+
+  /** What each roundoff obligation came to, for the witness file: where it is, its status, time
+    * and solver column as in the summary, then what bounding it found, with every digit.
+    */
+  private def obligationRecords(results: Map[VC, VCResult]): Seq[Json] =
+    results.toSeq.flatMap { case (vc, result) =>
+      val obligationAndField = vc.kind match {
+        case VCKind.RoundoffError(_, field) => Some(("error", field))
+        case VCKind.RoundoffCases => Some(("case agreement", None))
+        case VCKind.RoundoffFinite(field) => Some(("finiteness", field))
+        case _ => None
+      }
+      obligationAndField.map { case (obligation, field) =>
+        val fd = getFunction(vc.fid)
+        val (file, line) = fd.getPos match {
+          case pos: inox.utils.DefinedPosition => (pos.file.getPath, pos.line)
+          case _ => ("", 0)
+        }
+        val where = Seq(
+          "function" -> Json.fromString(fd.id.name), "file" -> Json.fromString(file),
+          "line" -> Json.fromInt(line), "obligation" -> Json.fromString(obligation),
+          "field" -> field.map(Json.fromString).getOrElse(Json.Null))
+        val outcome = Seq(
+          "status" -> Json.fromString(result.status.name),
+          "seconds" -> result.time.map(ms => Json.fromDoubleOrNull(ms / 1000.0)).getOrElse(Json.Null),
+          "solver" -> result.solverName.map(Json.fromString).getOrElse(Json.Null))
+        val details = obligationDetails.getOrElse((vc.fid, obligation, field), Seq.empty)
+        ((file, line, fd.id.name, obligation, field.getOrElse("")), Json.obj(where ++ outcome ++ details*))
+      }
+    }.sortBy(_._1).map(_._2)
 
   /** What each function calls its inputs, in the order it declares them. */
   private lazy val parameterNames: Map[String, Seq[String]] =
@@ -313,41 +373,52 @@ trait RoundoffChecker extends VerificationChecker {
     val obligationName = displayName(fid, field)
     val (upperBoundTime, upperBoundResult) = upperBound(fid, field)
     val lowerBoundResult = fuzzDriver.lowerBound(fd, field)
+    val lower = lowerBoundResult.flatMap(_.toOption)
 
-    val (vcStatus, upper, lower) = upperBoundResult match {
+    // The status, the bound if there is one, and why there is none otherwise.
+    val (vcStatus, upper, whyNoBound) = upperBoundResult match {
       case scala.util.Success(Right(bound: ErrorBound)) =>
         val worstVariant = if (bound.variant.isEmpty) "" else s", largest with ${bound.variant}"
         reporter.info(fd.getPos,
           s"Inferred a roundoff error of ${bound.total} for $obligationName$worstVariant")
-        lowerBoundResult.foreach(reportFuzzedRange(fd, obligationName, bound.total, _))
-        (statusAgainstMaxBound(fd, obligationName, bound.total, maxUpperBound), Some(bound),
-         lowerBoundResult)
+        lower.foreach(reportFuzzedRange(fd, obligationName, bound.total, _))
+        (statusAgainstMaxBound(fd, obligationName, bound.total, maxUpperBound), Some(bound), None)
 
       case scala.util.Success(Right(Unbounded(mayBe, reason, variant))) =>
         val inVariant = if (variant.isEmpty) "" else s" with $variant"
         reporter.warning(fd.getPos,
           s"The roundoff error of $obligationName$inVariant may be $mayBe: $reason")
-        (VCStatus.Unknown, None, lowerBoundResult)
+        (VCStatus.Unknown, None, Some(s"may be $mayBe$inVariant: $reason"))
 
       case scala.util.Success(Right(Unreachable)) =>
         reporter.info(fd.getPos, s"No roundoff error possible for $obligationName")
-        (VCStatus.Valid, None, lowerBoundResult)
+        (VCStatus.Valid, None, Some("no input reaches a path holding it"))
 
       case scala.util.Success(Left(why)) =>
         reporter.warning(fd.getPos, s"Cannot bound the roundoff error of $obligationName: $why")
-        (VCStatus.Unsupported, None, lowerBoundResult)
+        (VCStatus.Unsupported, None, Some(why))
 
       case scala.util.Failure(outOfTime: OutOfTime) =>
         reporter.warning(fd.getPos, s"Roundoff analysis of $obligationName ran out of time: " +
           s"${outOfTime.getMessage}; --timeout raises it")
-        (VCStatus.Timeout, None, lowerBoundResult)
+        (VCStatus.Timeout, None, Some(s"ran out of time: ${outOfTime.getMessage}"))
 
       case scala.util.Failure(thrown) =>
         reporter.warning(fd.getPos, s"Roundoff analysis of $obligationName failed: ${thrown.getMessage}")
         reporter.debug(thrown.getStackTrace.take(12).mkString("\n"))(
           using DebugSectionVerification)
-        (VCStatus.Unsupported, None, None)
+        (VCStatus.Unsupported, None, Some(s"failed: ${thrown.getMessage}"))
     }
+
+    recordDetails(fid, "error", field,
+      "bound" -> upper.map(b => Json.fromBigDecimal(b.total)),
+      "rounding" -> upper.map(b => Json.fromBigDecimal(b.rounding)),
+      "divergence" -> upper.filter(_.guarded).map(b => Json.fromBigDecimal(b.divergence)),
+      "largestWith" -> upper.map(_.variant).filter(_.nonEmpty).map(Json.fromString),
+      "limit" -> maxUpperBound.map(Json.fromBigDecimal),
+      "reason" -> whyNoBound.map(Json.fromString),
+      "fuzzed" -> lower.map(Json.fromBigDecimal),
+      "fuzzerReason" -> lowerBoundResult.flatMap(_.left.toOption).map(Json.fromString))
 
     // Shown in the solver column of the summary, such as `daisy: 1.2E-15 + ibex: 0.5`.
     val boundFigures =
@@ -397,36 +468,48 @@ trait RoundoffChecker extends VerificationChecker {
     val (time, result) = upperBound(fid, Some(RoundoffErrorDecomposition.caseVCLabel))
     val runs = s"the floating-point and the real-valued run of ${fid.name}"
 
-    val status = result match {
+    // The status, and why it is not valid.
+    val (status, whyNotValid) = result match {
       case scala.util.Success(Right(bound: ErrorBound)) if bound.total == 0 =>
         reporter.info(fd.getPos, s"${runs.capitalize} end in the same case on every input")
-        VCStatus.Valid
+        (VCStatus.Valid, None)
 
       case scala.util.Success(Right(Unreachable)) =>
         reporter.info(fd.getPos, s"${runs.capitalize} end in the same case: no input reaches any path")
-        VCStatus.Valid
+        (VCStatus.Valid, None)
 
       case scala.util.Success(Right(_)) =>
         reporter.warning(fd.getPos,
           s"${runs.capitalize} may end in different cases: no Ibex query ruled it out ")
-        VCStatus.Unknown
+        (VCStatus.Unknown, Some("no Ibex query ruled out that the runs end in different cases"))
 
       case scala.util.Success(Left(why)) =>
         reporter.warning(fd.getPos, s"Cannot tell whether $runs end in the same case: $why")
-        VCStatus.Unsupported
+        (VCStatus.Unsupported, Some(why))
 
       case scala.util.Failure(outOfTime: OutOfTime) =>
         reporter.warning(fd.getPos, s"Telling whether $runs end in the same case ran out " +
           s"of time: ${outOfTime.getMessage}; --timeout raises it")
-        VCStatus.Timeout
+        (VCStatus.Timeout, Some(s"ran out of time: ${outOfTime.getMessage}"))
 
       case scala.util.Failure(thrown) =>
         reporter.warning(fd.getPos,
           s"Telling whether $runs end in the same case failed: ${thrown.getMessage}")
-        VCStatus.Unsupported
+        (VCStatus.Unsupported, Some(s"failed: ${thrown.getMessage}"))
     }
 
     val fuzzed = fuzzDriver.caseDivergences(fd)
+    recordDetails(fid, "case agreement", None,
+      "reason" -> whyNotValid.map(Json.fromString),
+      "fuzzedCaseDivergences" -> fuzzed.map(divergences => Json.arr(divergences.map { divergence =>
+        Json.obj(
+          "cases" -> Json.arr(divergence.cases.map { case (path, floatingPoint, precise) =>
+            Json.obj("path" -> Json.fromString(path), "floatingPoint" -> Json.fromString(floatingPoint),
+                     "precise" -> Json.fromString(precise))
+          }*),
+          "runs" -> Json.fromLong(divergence.runs),
+          "example" -> Json.fromString(divergence.example))
+      }*)))
     fuzzed.filter(_.nonEmpty).foreach(reportFuzzedCases(fd, status, _))
     val fuzzedRuns = fuzzed.map { divergences =>
       divergences.map(_.runs).sum match {
