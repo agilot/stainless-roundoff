@@ -63,6 +63,7 @@ trait MainHelpers extends inox.MainHelpers { self =>
     verification.roundoff.optRoundoffIncumbent -> Description(Verification, "Set aside a branch-divergence query that cannot reach as far as one already answered, since the error of a function is the widest of its divergences"),
     verification.roundoff.optRoundoffPathRanges -> Description(Verification, "Bound a leaf over the inputs that reach it, narrowing its ranges by every guard above it that compares an input against a literal"),
     verification.roundoff.optRoundoffOnly -> Description(Verification, "Check only the @roundoff obligations (error, case agreement and finiteness), and leave every other obligation out of the run and the report"),
+    verification.roundoff.optRoundoffFiniteness -> Description(Verification, "Check that each number of a @roundoff result is neither NaN nor an infinity; false leaves these obligations out of the run and the report"),
     verification.roundoff.optRoundoffFeasibilityShare -> Description(Verification, "Fraction of a branch-divergence query's share spent deciding whether its region is empty, the rest going on the two ends of the enclosure"),
     inox.solvers.smtlib.optimization.optIbexQuery -> Description(Verification, "Path to the Ibex SMT-LIB server used to bound branch divergence"),
     inox.solvers.smtlib.optimization.optIbexEpsF -> Description(Verification, "How closely Ibex must bracket a branch-divergence optimum, in absolute terms"),

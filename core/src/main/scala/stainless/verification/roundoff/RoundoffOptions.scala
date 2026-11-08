@@ -23,6 +23,7 @@ object optRoundoffExactInputs extends inox.FlagOptionDef("roundoff-exact-inputs"
 object optRoundoffIncumbent extends inox.FlagOptionDef("roundoff-incumbent", true)
 object optRoundoffPathRanges extends inox.FlagOptionDef("roundoff-path-ranges", true)
 object optRoundoffOnly extends inox.FlagOptionDef("roundoff-only", false)
+object optRoundoffFiniteness extends inox.FlagOptionDef("roundoff-finiteness", true)
 
 object optRoundoffFeasibilityShare extends inox.DoubleOptionDef("roundoff-feasibility-share", 0.1, "0..1")
 object optRoundoffRefineShare extends inox.DoubleOptionDef("roundoff-refine-share", 0.5, "0..1")
@@ -82,6 +83,7 @@ case class RoundoffSettings(
   incumbent: Boolean,
   pathRanges: Boolean,
   roundoffOnly: Boolean,
+  finiteness: Boolean,
   timeout: Option[Double],
   feasibilityShare: Double,
   witnessFile: Option[java.io.File],
@@ -109,6 +111,7 @@ object RoundoffSettings {
       incumbent = get(optRoundoffIncumbent),
       pathRanges = get(optRoundoffPathRanges),
       roundoffOnly = get(optRoundoffOnly),
+      finiteness = get(optRoundoffFiniteness),
       timeout = ctx.options.findOption(inox.optTimeout).map(_.toNanos / 1e9).filter(_ > 0),
       feasibilityShare = share(optRoundoffFeasibilityShare),
       witnessFile = Some(get(optRoundoffWitnesses)).filter(_.nonEmpty).map(new java.io.File(_)),

@@ -69,6 +69,11 @@ trait RoundoffChecker extends VerificationChecker {
   private def factoryFor(solver: String): TimeoutSolverFactory =
     getFactory(options + inox.optSelectedSolvers(Set(solver)))
 
+  private def isFinitenessObligation(vc: VC): Boolean = vc.kind match {
+    case VCKind.RoundoffFinite(_) => true
+    case _ => false
+  }
+
   private def isRoundoffObligation(vc: VC): Boolean = vc.kind match {
     case VCKind.RoundoffError(_, _) | VCKind.RoundoffCases | VCKind.RoundoffFinite(_) => true
     case _ => false
@@ -92,8 +97,10 @@ trait RoundoffChecker extends VerificationChecker {
       fuzzDriver.run()
     }
 
-    // With `--roundoff-only`, the other obligations are neither checked nor reported.
-    val checked = if (settings.roundoffOnly) vcs.filter(isRoundoffObligation) else vcs
+    // With `--roundoff-only`, the other obligations are neither checked nor reported, and
+    // neither are the finiteness ones with `--roundoff-finiteness=false`.
+    val checked = vcs.filter(vc => !settings.roundoffOnly || isRoundoffObligation(vc))
+      .filter(vc => settings.finiteness || !isFinitenessObligation(vc))
     val witnessFile = settings.witnessFile
       .filter(file => obligations.nonEmpty && settings.timeout.isDefined && fuzzDriver.sourcesReplacedBy(file).isEmpty)
     super.verify(checked, stopWhen)
