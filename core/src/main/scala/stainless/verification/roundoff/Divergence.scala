@@ -669,12 +669,18 @@ private[roundoff] final class DivergenceSearch(ibex: IbexRunner, settings: Round
     }
   }
 
+  /** `pairs` stands for the approaches before blocks, so it bounds every pair on its own. A
+    * function `linear-refine` sends to `pairs` keeps the incumbent.
+    */
+  private val setsAsideDominated =
+    settings.incumbent && settings.discontinuity != DiscontinuityMode.Pairs
+
   private def boundComparison(region: GuardRegion, comparison: Comparison, pass: SharedQueryTime)
     : Either[String, ComparisonBound] = {
     // Also for a comparison answered without Ibex, which `secondsForNextQuery` never sees.
     if (pass.limit.secondsLeft <= 0)
       throw new OutOfTime("the divergence queries took longer than their share of the budget")
-    ibex.boundComparison(function, bands, region, comparison, pass)
+    ibex.boundComparison(function, bands, region, comparison, pass, setsAsideDominated)
   }
 
   /** A region across a guard both runs read the same way is answered by its first comparison
@@ -766,8 +772,11 @@ private[roundoff] final class DivergenceSearch(ibex: IbexRunner, settings: Round
       settledBounds += settledBound
       largestSettledBound = largestSettledBound max settledBound.bound
     }
+    // Refinement lowers open bounds later, so with it only a settled bound is a bar that stays.
+    // Without it, every bound found so far is final, and a block must beat the largest.
     def boundBlock(region: GuardRegion, block: Comparison.Block, pass: SharedQueryTime) = {
-      pass.incumbent = largestSettledBound
+      pass.incumbent =
+        if (refineQueryBudget == 0) pass.incumbent max largestSettledBound else largestSettledBound
       boundComparison(region, block, pass)
     }
 
@@ -861,8 +870,8 @@ class IbexRunner(ctx: inox.Context, settings: RoundoffSettings, recordWitnesses:
   /** How far apart the leaves of `comparison` can be where `region.guard` is read the wrong
     * way, in three steps, each cheaper than the next:
     *  1. is there a point where both paths can be taken? If not, it is infeasible;
-    *  2. can the distance reach the incumbent? If not, it cannot change the result (only with
-    *     `--roundoff-incumbent`);
+    *  2. can the distance reach the incumbent? If not, it cannot change the result (only if
+    *     `setsAsideDominated`);
     *  3. otherwise, bound the distance: at both ends for a pair, whose difference can have
     *     either sign, and only from above for a block, which is never negative.
     *
@@ -878,7 +887,7 @@ class IbexRunner(ctx: inox.Context, settings: RoundoffSettings, recordWitnesses:
     * ([[checkWithin]]), and the query then throws [[OutOfTime]].
     */
   def boundComparison(function: String, bands: GuardBands, region: GuardRegion, comparison: Comparison,
-            pass: SharedQueryTime): Either[String, ComparisonBound] = synchronized {
+            pass: SharedQueryTime, setsAsideDominated: Boolean): Either[String, ComparisonBound] = synchronized {
     val site = DivergenceSite(function, region.guard, comparison.pairLeaves)
 
     if (bands.isExact(region.guard)) {
@@ -930,7 +939,8 @@ class IbexRunner(ctx: inox.Context, settings: RoundoffSettings, recordWitnesses:
             traverse(terms.zipWithIndex) { case (objective, i) =>
               boundObjective(objective, region.vars, boundedConstraints,
                              signed = comparison.pairLeaves.isDefined,
-                             new TimeLimit(queryTime.secondsLeft / (terms.size - i)), pass, site)
+                             new TimeLimit(queryTime.secondsLeft / (terms.size - i)), pass, site,
+                             setsAsideDominated)
             }.map { objectiveResults =>
               val worst = objectiveResults.maxBy(_.bound)
               ComparisonBound(region, boundedComparison, worst.bound, worst.stoppedEarly, worst.isIncumbent,
@@ -990,7 +1000,7 @@ class IbexRunner(ctx: inox.Context, settings: RoundoffSettings, recordWitnesses:
 
   private def boundObjective(objective: Expr, vars: Seq[ValDef], constraints: Seq[Expr],
                              signed: Boolean, time: TimeLimit, pass: SharedQueryTime,
-                             site: DivergenceSite): Either[String, ObjectiveResult] =
+                             site: DivergenceSite, setsAsideDominated: Boolean): Either[String, ObjectiveResult] =
     IbexRunner.constantValue(objective) match {
       // A constant needs no search: once the region may hold a point, it is its own bound.
       case Some(value) =>
@@ -1000,7 +1010,7 @@ class IbexRunner(ctx: inox.Context, settings: RoundoffSettings, recordWitnesses:
       case None =>
         withProblem(vars, IbexRunner.constraintsLinkedTo(objective, constraints), objective) {
           val target = pass.incumbent
-          if (settings.incumbent && target > 0 &&
+          if (setsAsideDominated && target > 0 &&
               !canReach(objective, signed, target, time, pass.limit)) {
             recordWitness(Witness(site, DivergenceStatus.Dominated))
             // The distance stays below the double `canReach` compared it with, so that double,
